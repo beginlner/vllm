@@ -32,6 +32,7 @@ class EngineArgs:
     revision: Optional[str] = None
     tokenizer_revision: Optional[str] = None
     quantization: Optional[str] = None
+    stop_preempted_request: bool = False
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -171,6 +172,9 @@ class EngineArgs:
                             choices=['awq', 'squeezellm', None],
                             default=None,
                             help='Method used to quantize the weights')
+        parser.add_argument('--stop-preempted-request',
+                            action='store_true',
+                            help='Whether to drop preempted request')
         return parser
 
     @classmethod
@@ -199,7 +203,8 @@ class EngineArgs:
         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,
                                            self.max_num_seqs,
                                            model_config.max_model_len,
-                                           self.max_paddings)
+                                           self.max_paddings,
+                                           self.stop_preempted_request)
         return model_config, cache_config, parallel_config, scheduler_config
 
 
