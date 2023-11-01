@@ -3,6 +3,7 @@ import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
 
+from vllm.entrypoints.load_balance_api import report_load_score
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig)
 from vllm.core.scheduler import Scheduler, SchedulerOutputs
@@ -115,6 +116,7 @@ class LLMEngine:
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config)
 
+        self.last_request_id: str = "0-0"
         # Logging.
         self.last_logging_time = 0.0
         # List of (timestamp, num_tokens)
@@ -234,6 +236,18 @@ class LLMEngine:
                      log_stats=not engine_args.disable_log_stats)
         return engine
 
+    def update_last_request_id(self, request_id: str):
+        try:
+            if _map_request_id(request_id) > _map_request_id(self.last_request_id):
+                self.last_request_id = request_id
+        except:
+            return
+
+    def get_payload(self) -> float:
+        """Returns current payload."""
+        return (self.scheduler.get_num_unfinished_seq_groups() /
+                self.scheduler_config.max_num_seqs)
+
     def add_request(
         self,
         request_id: str,
@@ -258,6 +272,8 @@ class LLMEngine:
             arrival_time: The arrival time of the request. If None, we use
                 the current monotonic time.
         """
+        self.update_last_request_id(request_id)
+        report_load_score(self.get_payload(), self.last_request_id)
         if arrival_time is None:
             arrival_time = time.monotonic()
         if prompt_token_ids is None:
@@ -531,11 +547,11 @@ class LLMEngine:
 
         # Free the finished sequence groups.
         self.scheduler.free_finished_seq_groups()
+        report_load_score(self.get_payload(), self.last_request_id)
 
         # Create the outputs.
         request_outputs: List[RequestOutput] = []
-        for seq_group in (scheduled_seq_groups +
-                          scheduler_outputs.ignored_seq_groups):
+        for seq_group in scheduled_seq_groups:
             request_output = RequestOutput.from_seq_group(seq_group)
             request_outputs.append(request_output)
 
@@ -711,3 +727,8 @@ class LLMEngine:
         for other_output in all_outputs[1:]:
             assert output == other_output
         return output
+
+
+def _map_request_id(request_id: str):
+    ts, idx = request_id.split("-")
+    return (int(ts), int(idx))

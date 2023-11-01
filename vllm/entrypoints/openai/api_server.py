@@ -10,7 +10,10 @@ from typing import AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import uvicorn
-from fastapi import Request
+import os
+import requests
+import threading
+from fastapi import Request, BackgroundTasks
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -25,6 +28,7 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse, ChatMessage, DeltaMessage, ErrorResponse,
     LogProbs, ModelCard, ModelList, ModelPermission, UsageInfo)
+from vllm.entrypoints.load_balance_api import init_load_balance
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -35,16 +39,171 @@ try:
     import fastchat
     from fastchat.conversation import Conversation, SeparatorStyle
     from fastchat.model.model_adapter import get_conversation_template
+    from fastchat.conversation import get_conv_template
     _fastchat_available = True
 except ImportError:
     _fastchat_available = False
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
+VLLM_HEART_BEAT_INTERVAL = int(os.getenv("VLLM_WORKER_HEART_BEAT_INTERVAL", 15))
 
-logger = init_logger(__name__)
+logger = init_logger("vllm")
 served_model = None
 app = fastapi.FastAPI()
 engine = None
+num_unfinished_requests = 0
+
+
+def increase():
+    global num_unfinished_requests
+    num_unfinished_requests += 1
+
+
+def decrease():
+    global num_unfinished_requests
+    num_unfinished_requests -= 1
+
+
+def create_background_tasks():
+    background_tasks = BackgroundTasks()
+    background_tasks.add_task(decrease)
+    return background_tasks
+
+
+class VLLMManager:
+    def __init__(
+        self,
+        worker_addr: str,
+        controller_addr: str,
+        model: str,
+        register: bool,
+        redis_config_file: str,
+    ):
+        self.worker_addr = worker_addr
+        self.controller_addr = controller_addr
+        self.model = model
+        self.register = register
+        self.headers = {"Host": "coder.deepseek.com"}
+
+        self.heart_beat_thread = None
+        if register:
+            self.running = True
+            self.init_heart_beat()
+            init_load_balance(worker_addr, redis_config_file)
+
+        self.suspend_thread = None
+        self.init_suspend_thread()
+
+    def init_heart_beat(self):
+
+        def heart_beat_worker():
+            time.sleep(5)  # Waiting server for initialization.
+            self.register_to_controller()
+            while True:
+                time.sleep(VLLM_HEART_BEAT_INTERVAL)
+                self.send_heart_beat()
+
+        self.heart_beat_thread = threading.Thread(
+            target=heart_beat_worker,
+            daemon=True,
+        )
+        self.heart_beat_thread.start()
+
+    def register_to_controller(self):
+        logger.info("Register to controller")
+
+        url = self.controller_addr + "/register_worker"
+        data = {
+            "worker_addr": self.worker_addr,
+            "model": self.model,
+        }
+        while True:
+            try:
+                ret = requests.post(
+                    url, json=data, timeout=5, headers=self.headers)
+                status = ret.json()["code"]
+                break
+            except (requests.exceptions.RequestException, KeyError) as e:
+                logger.error(f"register worker error: {e}")
+            time.sleep(5)
+
+        assert status == 0
+
+    def send_heart_beat(self):
+        global num_unfinished_requests
+        logger.info(f"Send heart beat. Model: {self.model} "
+                    f"num_unfinished_requests: {num_unfinished_requests}")
+
+        url = self.controller_addr + "/receive_heart_beat"
+        data = {
+            "worker_addr": self.worker_addr,
+            "model": self.model,
+            "num_unfinished_requests": num_unfinished_requests,
+        }
+        while True:
+            try:
+                ret = requests.post(
+                    url, json=data, timeout=5, headers=self.headers)
+                status = ret.json()["code"]
+                break
+            except (requests.exceptions.RequestException, KeyError) as e:
+                logger.error(f"heart beat error: {e}")
+            time.sleep(5)
+
+        if status != 0 and self.running:
+            self.register_to_controller()
+
+    def init_suspend_thread(self):
+
+        def suspend_worker():
+            import hfai
+            while True:
+                if hfai.receive_suspend_command():
+                    logger.info(f"Receive suspend command")
+                    break
+                time.sleep(1)
+            if self.register:
+                self.running = False
+                self.send_suspend()
+            time.sleep(5)  # To be conservative.
+            global num_unfinished_requests
+            while num_unfinished_requests > 0:
+                logger.info(
+                    f"num_unfinished_requests: {num_unfinished_requests}")
+                time.sleep(1)
+            time.sleep(3)  # To be conservative.
+            logger.info(f"Go suspend")
+            os.environ["MARSV2_TASK_TYPE"] = "training"  # Hack
+            hfai.go_suspend()
+
+        self.suspend_thread = threading.Thread(
+            target=suspend_worker,
+            daemon=True,
+        )
+        self.suspend_thread.start()
+
+    def send_suspend(self):
+        if not self.register:
+            return
+
+        logger.info("Send suspend to controller")
+
+        url = self.controller_addr + "/receive_suspend"
+        data = {
+            "worker_addr": self.worker_addr,
+            "model": self.model,
+        }
+        while True:
+            try:
+                ret = requests.post(
+                    url, json=data, timeout=5, headers=self.headers)
+                status = ret.json()["code"]
+                break
+            except (requests.exceptions.RequestException, KeyError) as e:
+                logger.error(f"send suspend error: {e}")
+            time.sleep(5)
+
+        assert status == 0
 
 
 def create_error_response(status_code: HTTPStatus,
@@ -69,7 +228,23 @@ async def check_model(request) -> Optional[JSONResponse]:
     return ret
 
 
-async def get_gen_prompt(request) -> str:
+def _add_to_set(s, new_stop) -> None:
+    if not s:
+        return
+    if isinstance(s, str):
+        new_stop.add(s)
+    else:
+        new_stop.update(s)
+
+
+def _merge(x, y) -> List:
+    ret = set()
+    _add_to_set(x, ret)
+    _add_to_set(y, ret)
+    return list(ret)
+
+
+async def get_gen_params(request: ChatCompletionRequest) -> Tuple[str, Dict]:
     if not _fastchat_available:
         raise ModuleNotFoundError(
             "fastchat is not installed. Please install fastchat to use "
@@ -80,20 +255,23 @@ async def get_gen_prompt(request) -> str:
             f"fastchat version is low. Current version: {fastchat.__version__} "
             "Please upgrade fastchat to use: `$ pip install -U fschat`")
 
-    conv = get_conversation_template(request.model)
-    conv = Conversation(
-        name=conv.name,
-        system_template=conv.system_template,
-        system_message=conv.system_message,
-        roles=conv.roles,
-        messages=list(conv.messages),  # prevent in-place modification
-        offset=conv.offset,
-        sep_style=SeparatorStyle(conv.sep_style),
-        sep=conv.sep,
-        sep2=conv.sep2,
-        stop_str=conv.stop_str,
-        stop_token_ids=conv.stop_token_ids,
-    )
+    if conv_template:
+        conv = get_conv_template(conv_template)
+    else:
+        conv = get_conversation_template(request.model)
+        conv = Conversation(
+            name=conv.name,
+            system_template=conv.system_template,
+            system_message=conv.system_message,
+            roles=conv.roles,
+            messages=list(conv.messages),  # prevent in-place modification
+            offset=conv.offset,
+            sep_style=SeparatorStyle(conv.sep_style),
+            sep=conv.sep,
+            sep2=conv.sep2,
+            stop_str=conv.stop_str,
+            stop_token_ids=conv.stop_token_ids,
+        )
 
     if isinstance(request.messages, str):
         prompt = request.messages
@@ -113,7 +291,24 @@ async def get_gen_prompt(request) -> str:
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
 
-    return prompt
+    sampling_params = dict(
+        n=request.n,
+        presence_penalty=request.presence_penalty,
+        frequency_penalty=request.frequency_penalty,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        stop=_merge(request.stop, conv.stop_str),
+        stop_token_ids=_merge(request.stop_token_ids, conv.stop_token_ids),
+        max_tokens=request.max_tokens,
+        best_of=request.best_of,
+        top_k=request.top_k,
+        ignore_eos=request.ignore_eos,
+        use_beam_search=request.use_beam_search,
+        skip_special_tokens=request.skip_special_tokens,
+        spaces_between_special_tokens=request.spaces_between_special_tokens,
+    )
+
+    return prompt, sampling_params
 
 
 async def check_length(
@@ -132,16 +327,15 @@ async def check_length(
 
     if request.max_tokens is None:
         request.max_tokens = max_model_len - token_num
-    if token_num + request.max_tokens > max_model_len:
+    if token_num >= max_model_len:
         return input_ids, create_error_response(
             HTTPStatus.BAD_REQUEST,
             f"This model's maximum context length is {max_model_len} tokens. "
-            f"However, you requested {request.max_tokens + token_num} tokens "
-            f"({token_num} in the messages, "
-            f"{request.max_tokens} in the completion). "
-            f"Please reduce the length of the messages or completion.",
+            f"However, you requested {token_num} in the messages. "
+            f"Please reduce the length of the messages.",
         )
     else:
+        request.max_tokens = min(request.max_tokens, max_model_len - token_num)
         return input_ids, None
 
 
@@ -192,7 +386,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
         - function_call (Users should implement this by themselves)
         - logit_bias (to be supported by vLLM engine)
     """
-    logger.info(f"Received chat completion request: {request}")
+    # logger.info(f"Received chat completion request: {request}")
 
     error_check_ret = await check_model(request)
     if error_check_ret is not None:
@@ -203,32 +397,17 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return create_error_response(HTTPStatus.BAD_REQUEST,
                                      "logit_bias is not currently supported")
 
-    prompt = await get_gen_prompt(request)
+    prompt, sampling_params = await get_gen_params(request)
     token_ids, error_check_ret = await check_length(request, prompt=prompt)
+    sampling_params["max_tokens"] = request.max_tokens
     if error_check_ret is not None:
         return error_check_ret
 
     model_name = request.model
-    request_id = f"cmpl-{random_uuid()}"
+    request_id = request.id or f"cmpl-{random_uuid()}"
     created_time = int(time.monotonic())
     try:
-        spaces_between_special_tokens = request.spaces_between_special_tokens
-        sampling_params = SamplingParams(
-            n=request.n,
-            presence_penalty=request.presence_penalty,
-            frequency_penalty=request.frequency_penalty,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            stop=request.stop,
-            stop_token_ids=request.stop_token_ids,
-            max_tokens=request.max_tokens,
-            best_of=request.best_of,
-            top_k=request.top_k,
-            ignore_eos=request.ignore_eos,
-            use_beam_search=request.use_beam_search,
-            skip_special_tokens=request.skip_special_tokens,
-            spaces_between_special_tokens=spaces_between_special_tokens,
-        )
+        sampling_params = SamplingParams(**sampling_params)
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
 
@@ -294,8 +473,10 @@ async def create_chat_completion(request: ChatCompletionRequest,
 
     # Streaming response
     if request.stream:
+        increase()
         return StreamingResponse(completion_stream_generator(),
-                                 media_type="text/event-stream")
+                                 media_type="text/event-stream",
+                                 background=create_background_tasks())
 
     # Non-streaming response
     final_res: RequestOutput = None
@@ -341,8 +522,10 @@ async def create_chat_completion(request: ChatCompletionRequest,
             yield f"data: {response_json}\n\n"
             yield "data: [DONE]\n\n"
 
+        increase()
         return StreamingResponse(fake_stream_generator(),
-                                 media_type="text/event-stream")
+                                 media_type="text/event-stream",
+                                 background=create_background_tasks())
 
     return response
 
@@ -361,7 +544,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
           suffix)
         - logit_bias (to be supported by vLLM engine)
     """
-    logger.info(f"Received completion request: {request}")
+    # logger.info(f"Received completion request: {request}")
 
     error_check_ret = await check_model(request)
     if error_check_ret is not None:
@@ -384,7 +567,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                                      "logit_bias is not currently supported")
 
     model_name = request.model
-    request_id = f"cmpl-{random_uuid()}"
+    request_id = request.id or f"cmpl-{random_uuid()}"
 
     use_token_ids = False
     if isinstance(request.prompt, list):
@@ -510,8 +693,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     # Streaming response
     if stream:
+        increase()
         return StreamingResponse(completion_stream_generator(),
-                                 media_type="text/event-stream")
+                                 media_type="text/event-stream",
+                                 background=create_background_tasks())
 
     # Non-streaming response
     final_res: RequestOutput = None
@@ -562,8 +747,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             yield f"data: {response_json}\n\n"
             yield "data: [DONE]\n\n"
 
+        increase()
         return StreamingResponse(fake_stream_generator(),
-                                 media_type="text/event-stream")
+                                 media_type="text/event-stream",
+                                 background=create_background_tasks())
 
     return response
 
@@ -573,6 +760,21 @@ if __name__ == "__main__":
         description="vLLM OpenAI-Compatible RESTful API server.")
     parser.add_argument("--host", type=str, default=None, help="host name")
     parser.add_argument("--port", type=int, default=8000, help="port number")
+    parser.add_argument(
+        "--worker-address", type=str, default="http://localhost:8000"
+    )
+    parser.add_argument(
+        "--controller-address", type=str, default="http://localhost:21001"
+    )
+    parser.add_argument("--register",
+                        action="store_true",
+                        help="Whether to regitser to the controller.")
+    parser.add_argument(
+        "--redis-config-file",
+        type=str,
+        default=None,
+        help="Redis configuration file of the load balance server."
+    )
     parser.add_argument("--allow-credentials",
                         action="store_true",
                         help="allow credentials")
@@ -594,6 +796,10 @@ if __name__ == "__main__":
                         help="The model name used in the API. If not "
                         "specified, the model name will be the same as "
                         "the huggingface name.")
+    parser.add_argument("--conv-template",
+                        type=str,
+                        default=None,
+                        help="The conversation template name.")
 
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
@@ -612,6 +818,7 @@ if __name__ == "__main__":
         served_model = args.served_model_name
     else:
         served_model = args.model
+    conv_template = args.conv_template
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -622,6 +829,14 @@ if __name__ == "__main__":
     tokenizer = get_tokenizer(engine_args.tokenizer,
                               tokenizer_mode=engine_args.tokenizer_mode,
                               trust_remote_code=engine_args.trust_remote_code)
+
+    vllm_manager = VLLMManager(
+        args.worker_address,
+        args.controller_address,
+        served_model,
+        args.register,
+        args.redis_config_file,
+    )
 
     uvicorn.run(app,
                 host=args.host,
