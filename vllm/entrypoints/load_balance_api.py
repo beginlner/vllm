@@ -4,6 +4,7 @@
 """
 
 import logging
+import json
 from redis import Redis
 from munch import Munch
 
@@ -12,10 +13,11 @@ __all__ = ['init_load_balance', 'report_load_score']
 
 
 # redis keys
-LB_SERVER_QUEUE_REDIS_KEY = 'lb_server_queue'
-LB_SERVER_SCORE_REDIS_KEY = 'lb_server_score'
-LB_READY_SERVER_SET_REDIS_KEY = 'lb_ready_server_set'
-LB_SERVER_LAST_REQ_ID_REDIS_KEY_PREFIX = 'lb_server_req_id'
+LB_SERVER_QUEUE_REDIS_KEY_PREFIX = 'lb_server_queue:v2'
+LB_SERVER_SCORE_REDIS_KEY = 'lb_server_score:v2'
+LB_READY_SERVER_SET_REDIS_KEY = 'lb_ready_server_set:v2'
+LB_SERVER_LAST_REQ_ID_REDIS_KEY_PREFIX = 'lb_server_req_id:v2'
+LB_SERVER_INFO_REDIS_KEY_PREFIX = 'lb_server_info:v2'
 
 _worker_addr = None
 _redis_client = None
@@ -64,6 +66,12 @@ def report_load_score(
     if (_redis_client.sismember(LB_READY_SERVER_SET_REDIS_KEY, _worker_addr)) == 0:
         return
 
+    server_info = _redis_client.get(f'{LB_SERVER_INFO_REDIS_KEY_PREFIX}_{_worker_addr}')
+    if server_info is None:
+        logging.warn('cannot get server model_type')
+        return
+    model_type = json.loads(server_info)['model_type']
+
     pipeline = _redis_client.pipeline()
     # 更新负载分数
     pipeline.zadd(LB_SERVER_SCORE_REDIS_KEY, {_worker_addr: score})
@@ -73,8 +81,6 @@ def report_load_score(
     if server_last_id is not None:
         if server_last_id.decode() == current_max_request_id:
             pipeline.delete(request_key)
-            logging.info(
-                f'hit server-side max request id: {current_max_request_id}')
         else:
             # 设置了 last_id 且当前请求不是 last id 时, 不重新加入队列
             pipeline.execute()
@@ -82,7 +88,7 @@ def report_load_score(
 
     # 加入待选队列, 或更新权重
     if score >= 3.0:    # 完全满载, 直接删除这个 worker_addr
-        pipeline.zrem(LB_SERVER_QUEUE_REDIS_KEY, _worker_addr)
+        pipeline.zrem(f'{LB_SERVER_QUEUE_REDIS_KEY_PREFIX}_{model_type}', _worker_addr)
     else:
-        pipeline.zadd(LB_SERVER_QUEUE_REDIS_KEY, {_worker_addr: score})
+        pipeline.zadd(f'{LB_SERVER_QUEUE_REDIS_KEY_PREFIX}_{model_type}', {_worker_addr: score})
     pipeline.execute()
