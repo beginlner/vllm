@@ -73,6 +73,7 @@ class ModelConfig:
         quantization: Optional[str] = None,
         enforce_eager: bool = False,
         max_context_len_to_capture: Optional[int] = None,
+        haillm_config: Optional[str] = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -99,6 +100,7 @@ class ModelConfig:
             self.tokenizer = model_path
 
         self.hf_config = get_config(self.model, trust_remote_code, revision)
+        self.hf_config.haillm_config = _get_haillm_config(haillm_config)
         self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
         self.max_model_len = _get_and_verify_max_len(self.hf_config,
                                                      max_model_len)
@@ -408,6 +410,13 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
 }
 
 _ROCM_NOT_SUPPORTED_DTYPE = ["float", "float32"]
+
+
+def _get_haillm_config(haillm_config: Optional[str], ) -> Optional[dict]:
+    if haillm_config is None:
+        return None
+    from hai_llm.utils import load_config
+    return load_config(haillm_config)
 
 
 def _get_and_verify_dtype(

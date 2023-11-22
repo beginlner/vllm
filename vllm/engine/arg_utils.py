@@ -36,6 +36,7 @@ class EngineArgs:
     enforce_eager: bool = False
     max_context_len_to_capture: int = 8192
     stop_preempted_request: bool = False
+    haillm_config: Optional[str] = None
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -206,6 +207,10 @@ class EngineArgs:
         parser.add_argument('--stop-preempted-request',
                             action='store_true',
                             help='Whether to drop preempted request')
+        parser.add_argument('--haillm_config',
+                            type=str,
+                            default=EngineArgs.haillm_config,
+                            help='hai-llm config')
         return parser
 
     @classmethod
@@ -225,7 +230,8 @@ class EngineArgs:
                                    self.dtype, self.seed, self.revision,
                                    self.tokenizer_revision, self.max_model_len,
                                    self.quantization, self.enforce_eager,
-                                   self.max_context_len_to_capture)
+                                   self.max_context_len_to_capture,
+                                   self.haillm_config)
         cache_config = CacheConfig(self.block_size,
                                    self.gpu_memory_utilization,
                                    self.swap_space,
