@@ -68,7 +68,9 @@ class Scheduler:
                                 self.scheduler_config.max_num_batched_tokens)
 
         # Instantiate the scheduling policy.
-        self.policy = PolicyFactory.get_policy(policy_name="fcfs")
+        self.policy = PolicyFactory.get_policy(
+            policy_name="lcfs" if self.scheduler_config.
+            stop_preempted_request else "fcfs")
         # Create the block space manager.
         self.block_manager = BlockSpaceManager(
             block_size=self.cache_config.block_size,
@@ -138,8 +140,12 @@ class Scheduler:
         # Fix the current time.
         now = time.monotonic()
 
+        total_num_gpu_blocks = self.cache_config.num_gpu_blocks
+        num_free_gpu_blocks = self.block_manager.get_num_free_gpu_blocks()
+        num_used_gpu_blocks = total_num_gpu_blocks - num_free_gpu_blocks
+        gpu_cache_usage = num_used_gpu_blocks / total_num_gpu_blocks
         # Join waiting sequences if possible.
-        if not self.swapped:
+        if not self.swapped and gpu_cache_usage <= 0.9:
             ignored_seq_groups: List[SequenceGroup] = []
             scheduled: List[SequenceGroup] = []
             # The total number of sequences on the fly, including the
@@ -290,7 +296,8 @@ class Scheduler:
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
-            ignored_seq_groups=[],
+            ignored_seq_groups=preempted
+            if self.scheduler_config.stop_preempted_request else [],
         )
         return scheduler_outputs
 
@@ -368,6 +375,13 @@ class Scheduler:
         # over sequence groups with a single sequence.
         # TODO(woosuk): Support recomputation for sequence groups with multiple
         # sequences. This may require a more sophisticated CUDA kernel.
+        if self.scheduler_config.stop_preempted_request:
+            logger.warning(
+                f"Request {seq_group.request_id} is preempted and stops.")
+            for seq in seq_group.get_seqs():
+                seq.status = SequenceStatus.FINISHED_PREEMPTED
+                self.block_manager.free(seq)
+            return
         if preemption_mode is None:
             if seq_group.get_max_num_running_seqs() == 1:
                 preemption_mode = PreemptionMode.RECOMPUTE

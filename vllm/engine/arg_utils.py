@@ -35,6 +35,7 @@ class EngineArgs:
     quantization: Optional[str] = None
     enforce_eager: bool = False
     max_context_len_to_capture: int = 8192
+    stop_preempted_request: bool = False
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -202,6 +203,9 @@ class EngineArgs:
                             help='maximum context length covered by CUDA '
                             'graphs. When a sequence has context length '
                             'larger than this, we fall back to eager mode.')
+        parser.add_argument('--stop-preempted-request',
+                            action='store_true',
+                            help='Whether to drop preempted request')
         return parser
 
     @classmethod
@@ -233,7 +237,8 @@ class EngineArgs:
         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,
                                            self.max_num_seqs,
                                            model_config.max_model_len,
-                                           self.max_paddings)
+                                           self.max_paddings,
+                                           self.stop_preempted_request)
         return model_config, cache_config, parallel_config, scheduler_config
 
 
