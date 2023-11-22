@@ -9,7 +9,7 @@ from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig)
 from vllm.model_executor import get_model, InputMetadata, set_random_seed
 from vllm.model_executor.parallel_utils.parallel_state import (
-    initialize_model_parallel)
+    initialize_model_parallel, get_pipeline_model_parallel_rank)
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
@@ -54,7 +54,8 @@ class Worker:
         self.rank = self.rank if self.rank is not None else int(
             os.getenv("RANK", "-1"))
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        self.device = torch.device(f"cuda:{local_rank}")
+        gpu_id = _get_gpu_id_from_local_rank(local_rank)
+        self.device = torch.device(f"cuda:{gpu_id}")
         if self.rank < 0:
             raise ValueError("Invalid or unspecified rank.")
         torch.cuda.set_device(self.device)
@@ -64,6 +65,7 @@ class Worker:
         # Initialize the distributed environment.
         _init_distributed_environment(self.parallel_config, self.rank,
                                       self.distributed_init_method)
+        self.pp_rank = get_pipeline_model_parallel_rank()
 
         # Initialize the model.
         set_random_seed(self.model_config.seed)
@@ -109,7 +111,8 @@ class Worker:
             seqs)
 
         # Execute the model.
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        num_layers = self.model_config.get_num_layers(self.parallel_config,
+                                                      self.pp_rank)
         self.model(
             input_ids=input_tokens,
             positions=input_positions,
@@ -124,7 +127,7 @@ class Worker:
         peak_memory = torch.cuda.max_memory_allocated()
         total_gpu_memory = get_gpu_memory()
         cache_block_size = CacheEngine.get_cache_block_size(
-            block_size, self.model_config, self.parallel_config)
+            block_size, self.model_config, self.parallel_config, self.pp_rank)
         num_gpu_blocks = int(
             (total_gpu_memory * gpu_memory_utilization - peak_memory) //
             cache_block_size)
@@ -144,7 +147,7 @@ class Worker:
         self.sliding_window = cache_config.sliding_window
 
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
-                                        self.parallel_config)
+                                        self.parallel_config, self.pp_rank)
         self.cache_events = self.cache_engine.events
         self.gpu_cache = self.cache_engine.gpu_cache
 
@@ -413,6 +416,16 @@ def _pad_to_alignment(x: List[int], multiple_of: int, pad: int) -> List[int]:
 
 def _pad_to_max(x: List[int], max_len: int, pad: int) -> List[int]:
     return x + [pad] * (max_len - len(x))
+
+
+def _get_gpu_id_from_local_rank(local_rank: int) -> int:
+    # For MarsV2 only
+    # There are only 4 NVLink connections between 0-1, 2-3, 4-6, 5-7.
+    devices = list(map(int, os.getenv("CUDA_VISIBLE_DEVICES").split(",")))
+    indexed_devices = list(enumerate(devices))
+    priority = [0, 1, 2, 3, 4, 6, 5, 7]
+    sorted_devices = sorted(indexed_devices, key=lambda x: priority[x[1]])
+    return sorted_devices[local_rank][0]
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
