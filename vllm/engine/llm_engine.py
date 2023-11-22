@@ -115,6 +115,7 @@ class LLMEngine:
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config)
 
+        self.last_request_id: str = ""
         # Logging.
         self.last_logging_time = 0.0
         # List of (timestamp, num_tokens)
@@ -246,6 +247,22 @@ class LLMEngine:
                      log_stats=not engine_args.disable_log_stats)
         return engine
 
+    def get_payload(self) -> Tuple[float, int]:
+        """Returns current payload and the monotonic timestamp."""
+        return (self.scheduler.get_num_unfinished_seq_groups() /
+                self.scheduler_config.max_num_seqs, time.monotonic_ns())
+
+    def update_last_request_id(self, request_id: str):
+        if self.last_request_id == "":
+            self.last_request_id = request_id
+            return
+        try:
+            if _map_request_id(request_id) > _map_request_id(
+                    self.last_request_id):
+                self.last_request_id = request_id
+        except:
+            self.last_request_id = request_id
+
     def add_request(
         self,
         request_id: str,
@@ -270,6 +287,7 @@ class LLMEngine:
             arrival_time: The arrival time of the request. If None, we use
                 the current monotonic time.
         """
+        self.update_last_request_id(request_id)
         if arrival_time is None:
             arrival_time = time.monotonic()
         if prompt_token_ids is None:
@@ -313,8 +331,10 @@ class LLMEngine:
     ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs,
                List[RequestOutput]]:
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
+        payload = self.get_payload()
         return seq_group_metadata_list, scheduler_outputs, [
-            RequestOutput.from_seq_group(seq_group)
+            RequestOutput.from_seq_group(seq_group, payload,
+                                         self.last_request_id)
             for seq_group in scheduler_outputs.ignored_seq_groups
         ]
 
@@ -545,11 +565,12 @@ class LLMEngine:
         self.scheduler.free_finished_seq_groups()
 
         # Create the outputs.
-        request_outputs: List[RequestOutput] = []
-        for seq_group in (scheduled_seq_groups +
-                          scheduler_outputs.ignored_seq_groups):
-            request_output = RequestOutput.from_seq_group(seq_group)
-            request_outputs.append(request_output)
+        payload = self.get_payload()
+        request_outputs = [
+            RequestOutput.from_seq_group(seq_group, payload,
+                                         self.last_request_id)
+            for seq_group in scheduled_seq_groups
+        ]
 
         if self.log_stats:
             # Log the system stats.
@@ -744,3 +765,8 @@ class LLMEngine:
         for other_output in all_outputs[1:]:
             assert output == other_output
         return output
+
+
+def _map_request_id(request_id: str):
+    ts, idx = request_id.split("-")
+    return (int(ts), int(idx))

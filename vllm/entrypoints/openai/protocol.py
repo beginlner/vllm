@@ -1,7 +1,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -73,6 +73,7 @@ class ChatCompletionRequest(BaseModel):
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     skip_special_tokens: Optional[bool] = True
     spaces_between_special_tokens: Optional[bool] = True
+    id: Optional[str] = None
 
 
 class CompletionRequest(BaseModel):
@@ -100,6 +101,7 @@ class CompletionRequest(BaseModel):
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     skip_special_tokens: Optional[bool] = True
     spaces_between_special_tokens: Optional[bool] = True
+    id: Optional[str] = None
 
 
 class LogProbs(BaseModel):
@@ -120,6 +122,8 @@ class CompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
+    payload: Optional[Tuple[float, int]] = None,
+    last_request_id: Optional[str] = None,
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
@@ -136,6 +140,8 @@ class CompletionStreamResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
+    payload: Optional[Tuple[float, int]] = None,
+    last_request_id: Optional[str] = None,
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo]
@@ -156,6 +162,8 @@ class ChatCompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
+    payload: Optional[Tuple[float, int]] = None,
+    last_request_id: Optional[str] = None,
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
@@ -176,6 +184,8 @@ class ChatCompletionStreamResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: str = "chat.completion.chunk"
     created: int = Field(default_factory=lambda: int(time.time()))
+    payload: Optional[Tuple[float, int]] = None,
+    last_request_id: Optional[str] = None,
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(

@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from vllm.sequence import (PromptLogprobs, SampleLogprobs, SequenceGroup,
                            SequenceStatus)
@@ -56,6 +56,8 @@ class RequestOutput:
         prompt_logprobs: The log probabilities to return per prompt token.
         outputs: The output sequences of the request.
         finished: Whether the whole request is finished.
+        payload: Current payload and the monotonic timestamp.
+        last_request_id: Last request id.
     """
 
     def __init__(
@@ -66,6 +68,8 @@ class RequestOutput:
         prompt_logprobs: Optional[PromptLogprobs],
         outputs: List[CompletionOutput],
         finished: bool,
+        payload: Optional[Tuple[float, int]],
+        last_request_id: Optional[str],
     ) -> None:
         self.request_id = request_id
         self.prompt = prompt
@@ -73,9 +77,16 @@ class RequestOutput:
         self.prompt_logprobs = prompt_logprobs
         self.outputs = outputs
         self.finished = finished
+        self.payload = payload
+        self.last_request_id = last_request_id
 
     @classmethod
-    def from_seq_group(cls, seq_group: SequenceGroup) -> "RequestOutput":
+    def from_seq_group(
+        cls,
+        seq_group: SequenceGroup,
+        payload: Optional[Tuple[float, int]] = None,
+        last_request_id: Optional[str] = None,
+    ) -> "RequestOutput":
         # Get the top-n sequences.
         n = seq_group.sampling_params.n
         seqs = seq_group.get_seqs()
@@ -109,7 +120,8 @@ class RequestOutput:
         prompt_logprobs = seq_group.prompt_logprobs
         finished = seq_group.is_finished()
         return cls(seq_group.request_id, prompt, prompt_token_ids,
-                   prompt_logprobs, outputs, finished)
+                   prompt_logprobs, outputs, finished, payload,
+                   last_request_id)
 
     def __repr__(self) -> str:
         return (f"RequestOutput(request_id={self.request_id}, "
