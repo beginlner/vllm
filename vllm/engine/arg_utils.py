@@ -34,6 +34,7 @@ class EngineArgs:
     tokenizer_revision: Optional[str] = None
     quantization: Optional[str] = None
     stop_preempted_request: bool = False
+    haillm_config: Optional[str] = None
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -186,6 +187,10 @@ class EngineArgs:
         parser.add_argument('--stop-preempted-request',
                             action='store_true',
                             help='Whether to drop preempted request')
+        parser.add_argument('--haillm_config',
+                            type=str,
+                            default=EngineArgs.haillm_config,
+                            help='hai-llm config')
         return parser
 
     @classmethod
@@ -204,7 +209,7 @@ class EngineArgs:
                                    self.download_dir, self.load_format,
                                    self.dtype, self.seed, self.revision,
                                    self.tokenizer_revision, self.max_model_len,
-                                   self.quantization)
+                                   self.quantization, self.haillm_config)
         cache_config = CacheConfig(
             self.block_size, self.gpu_memory_utilization, self.swap_space,
             getattr(model_config.hf_config, 'sliding_window', None))
