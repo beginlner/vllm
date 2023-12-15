@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+from flash_attn.flash_attn_interface import flash_attn_with_blocked_kvcache
 from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
                                          LowerTriangularMaskWithTensorBias)
@@ -77,10 +78,10 @@ class PagedAttention(nn.Module):
             query: shape = [batch_size, seq_len, num_heads * head_size]
             key: shape = [batch_size, seq_len, num_kv_heads * head_size]
             value: shape = [batch_size, num_kv_heads * head_size]
-            key_cache: shape = [num_blocks, num_kv_heads, head_size/x,
-                block_size, x]
-            value_cache: shape = [num_blocks, num_kv_heads, head_size,
-                block_size]
+            key_cache: shape = [num_blocks, block_size, num_kv_heads,
+                head_size]
+            value_cache: shape = [num_blocks, block_size, num_kv_heads,
+                head_size]
             input_metadata: metadata for the inputs.
             cache_event: event to wait for the cache operations to finish.
         Returns:
@@ -108,7 +109,7 @@ class PagedAttention(nn.Module):
                 value_to_cache = value_to_cache[input_metadata.to_cache]
                 slot_mapping = slot_mapping[input_metadata.to_cache]
 
-            cache_ops.reshape_and_cache(
+            cache_ops.cache(
                 key_to_cache,
                 value_to_cache,
                 key_cache,
@@ -226,6 +227,16 @@ def _paged_attention(
     scale: float,
     alibi_slopes: Optional[torch.Tensor],
 ) -> torch.Tensor:
+    return flash_attn_with_blocked_kvcache(
+        query.unsqueeze(1),
+        key_cache,
+        value_cache,
+        input_metadata.block_tables,
+        input_metadata.context_lens,
+        softmax_scale=scale,
+        causal=True,
+        alibi_slopes=alibi_slopes,
+    )
     output = torch.empty_like(query)
 
     block_size = value_cache.shape[3]

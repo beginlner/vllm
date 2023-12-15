@@ -155,15 +155,22 @@ class ModelConfig:
                 " must be divisible by tensor parallel size "
                 f"({tensor_parallel_size}).")
 
+    def has_value_cache(self) -> bool:
+        return not hasattr(self.hf_config, "kv_lora_rank")
+
     def get_hidden_size(self) -> int:
         return self.hf_config.hidden_size
 
     def get_head_size(self) -> int:
+        if hasattr(self.hf_config, "kv_lora_rank"):
+            return self.hf_config.kv_lora_rank
         # FIXME(woosuk): This may not be true for all models.
         return self.hf_config.hidden_size // self.hf_config.num_attention_heads
 
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads."""
+        if hasattr(self.hf_config, "kv_lora_rank"):
+            return 1
         # For GPTBigCode & Falcon:
         # NOTE: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of

@@ -23,11 +23,15 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 from typing import Any, Dict, List, Optional, Tuple
 import re
+import math
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
+from flash_attn.flash_attn_interface import flash_attn_with_blocked_kvcache
+from einops import rearrange
 
+from vllm._C import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttention
@@ -35,14 +39,16 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
+                                               ReplicatedLinear,
+                                               ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding, ParallelLMHead)
 from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_world_size, get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size)
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
+    get_pipeline_model_parallel_rank, get_pipeline_model_parallel_world_size)
 from vllm.model_executor.parallel_utils.pipeline_parallel import (
     send_to_next_pp_rank, receive_from_prev_pp_rank)
 from vllm.model_executor.weight_utils import (default_weight_loader,
@@ -162,6 +168,141 @@ class LlamaAttention(nn.Module):
         return output
 
 
+def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
+    closest_power_of_2 = 2**math.floor(math.log2(total_num_heads))
+    base = torch.tensor(
+        2**(-(2**-(math.log2(closest_power_of_2) - 3))),
+        dtype=torch.float32,
+    )
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
+    slopes = torch.pow(base, powers)
+
+    if closest_power_of_2 != total_num_heads:
+        extra_base = torch.tensor(
+            2**(-(2**-(math.log2(2 * closest_power_of_2) - 3))),
+            dtype=torch.float32,
+        )
+        num_remaining_heads = min(closest_power_of_2,
+                                  total_num_heads - closest_power_of_2)
+        extra_powers = torch.arange(start=1,
+                                    end=1 + 2 * num_remaining_heads,
+                                    step=2,
+                                    dtype=torch.int32)
+        slopes = torch.cat(
+            [slopes, torch.pow(extra_base, extra_powers)], dim=0)
+    return slopes
+
+
+class KVLoraAttention(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        rank: int,
+        num_heads: int,
+        linear_method: Optional[LinearMethodBase] = None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.rank = rank
+        self.total_num_heads = num_heads
+        self.head_dim = self.hidden_size // self.total_num_heads
+        assert self.head_dim * self.total_num_heads == self.hidden_size
+
+        tp_world_size = get_tensor_model_parallel_world_size()
+        assert self.total_num_heads % tp_world_size == 0
+        self.num_heads = self.total_num_heads // tp_world_size
+
+        self.q_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+            linear_method=linear_method,
+        )
+        self.lora_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.rank,
+            bias=False,
+            linear_method=linear_method,
+        )
+        self.kv_proj = MergedColumnParallelLinear(
+            self.rank,
+            [self.hidden_size] * 2,
+            bias=False,
+            linear_method=linear_method,
+        )
+        self.o_proj = RowParallelLinear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+            linear_method=linear_method,
+        )
+
+        # Create the alibi slopes and slice them.
+        tp_rank = get_tensor_model_parallel_rank()
+        head_start = tp_rank * self.num_heads
+        head_end = (tp_rank + 1) * self.num_heads
+        alibi_slopes = _get_alibi_slopes(self.total_num_heads)
+        self.alibi_slopes = alibi_slopes[head_start:head_end]
+
+        self.scale = self.head_dim**-0.5
+        self.attn = PagedAttention(self.num_heads,
+                                   self.head_dim,
+                                   self.scale,
+                                   alibi_slopes=self.alibi_slopes.tolist())
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
+    ) -> torch.Tensor:
+        del positions  # Unused.
+        q, _ = self.q_proj(hidden_states)
+        kv_lora, _ = self.lora_proj(hidden_states)
+        if cache_event is not None:
+            cache_event.wait()
+        kv_cache, _ = kv_cache
+        # Store kv_lora in the cache.
+        # If kv_cache is None, the new key and value vectors will not be
+        # cached. This happens during the initial memory profiling run.
+        if kv_cache is not None:
+            cache_ops.cache(
+                kv_lora.view(-1, 1, self.rank),
+                None,
+                kv_cache,
+                None,
+                input_metadata.slot_mapping,
+            )
+        is_prompt = len(input_metadata.prompt_lens) > 0
+        if is_prompt:
+            kv, _ = self.kv_proj(kv_lora)
+            k, v = kv.chunk(2, dim=-1)
+            o = self.attn(q, k, v, None, None, input_metadata, None)
+        else:
+            q = rearrange(q, "b s (h d) -> b s h d", d=self.head_dim)
+            Wk, Wv = rearrange(self.kv_proj.linear_weights["weight"],
+                               "(two h d) r -> two h d r",
+                               two=2, d=self.head_dim)
+            q = torch.einsum("b s h d, h d r -> b s h r", q, Wk)
+            o = flash_attn_with_blocked_kvcache(
+                q,
+                kv_cache,
+                kv_cache,
+                input_metadata.block_tables,
+                input_metadata.context_lens,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+            )
+            o = torch.einsum("b s h r, h d r -> b s h d", o, Wv)
+            o = rearrange(o, "b s h d -> b s (h d)")
+        output, _ = self.o_proj(o)
+        return output
+
+
 class LlamaDecoderLayer(nn.Module):
 
     def __init__(
@@ -175,15 +316,23 @@ class LlamaDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        self.self_attn = LlamaAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            linear_method=linear_method,
-        )
+        if hasattr(config, "kv_lora_rank"):
+            self.self_attn = KVLoraAttention(
+                hidden_size=self.hidden_size,
+                rank=config.kv_lora_rank,
+                num_heads=config.num_attention_heads,
+                linear_method=linear_method,
+            )
+        else:
+            self.self_attn = LlamaAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                linear_method=linear_method,
+            )
         if config.haillm_config is not None and hasattr(
                 config.haillm_config.gpt, "moe"):
             tp_size = get_tensor_model_parallel_world_size()
@@ -337,14 +486,23 @@ class LlamaForCausalLM(nn.Module):
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
                      revision: Optional[str] = None):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        if hasattr(self.config, "kv_lora_rank"):
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("kv_proj", "k_proj", 0),
+                ("kv_proj", "v_proj", 1),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
+        else:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
         params_dict = dict(self.named_parameters())
 
         num_layers_per_pp_rank = self.config.num_hidden_layers // self.pp_size

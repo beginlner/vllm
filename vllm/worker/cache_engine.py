@@ -38,6 +38,7 @@ class CacheEngine:
         self.dtype = model_config.dtype
 
         self.block_size = cache_config.block_size
+        self.has_value_cache = self.model_config.has_value_cache()
         self.num_gpu_blocks = cache_config.num_gpu_blocks
         self.num_cpu_blocks = cache_config.num_cpu_blocks
 
@@ -52,20 +53,17 @@ class CacheEngine:
         self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
 
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
-        element_size = torch.tensor([], dtype=self.dtype).element_size()
-        x = 16 // element_size
         return (
-            self.num_heads,
-            self.head_size // x,
             self.block_size,
-            x,
+            self.num_heads,
+            self.head_size,
         )
 
     def get_value_block_shape(self) -> Tuple[int, int, int]:
         return (
+            self.block_size,
             self.num_heads,
             self.head_size,
-            self.block_size,
         )
 
     def allocate_gpu_cache(self) -> List[KVCache]:
@@ -78,11 +76,14 @@ class CacheEngine:
                 dtype=self.dtype,
                 device="cuda",
             )
-            value_blocks = torch.empty(
-                size=(self.num_gpu_blocks, *value_block_shape),
-                dtype=self.dtype,
-                device="cuda",
-            )
+            if self.has_value_cache:
+                value_blocks = torch.empty(
+                    size=(self.num_gpu_blocks, *value_block_shape),
+                    dtype=self.dtype,
+                    device="cuda",
+                )
+            else:
+                value_blocks = key_blocks
             gpu_cache.append((key_blocks, value_blocks))
         return gpu_cache
 
@@ -102,11 +103,14 @@ class CacheEngine:
                 dtype=self.dtype,
                 pin_memory=pin_memory,
             )
-            value_blocks = torch.empty(
-                size=(self.num_cpu_blocks, *value_block_shape),
-                dtype=self.dtype,
-                pin_memory=pin_memory,
-            )
+            if self.has_value_cache:
+                value_blocks = torch.empty(
+                    size=(self.num_cpu_blocks, *value_block_shape),
+                    dtype=self.dtype,
+                    pin_memory=pin_memory,
+                )
+            else:
+                value_blocks = key_blocks
             cpu_cache.append((key_blocks, value_blocks))
         return cpu_cache
 
@@ -146,13 +150,14 @@ class CacheEngine:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
         pp_rank: int,
+        has_value_cache: bool,
     ) -> int:
         head_size = model_config.get_head_size()
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_layers = model_config.get_num_layers(parallel_config, pp_rank)
 
         key_cache_block = block_size * num_heads * head_size
-        value_cache_block = key_cache_block
+        value_cache_block = key_cache_block if has_value_cache else 0
         total = num_layers * (key_cache_block + value_cache_block)
         dtype_size = _get_dtype_size(model_config.dtype)
         return dtype_size * total
