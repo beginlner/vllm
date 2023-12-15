@@ -65,6 +65,7 @@ class Worker:
 
         # This env var set by Ray causes exceptions with graph building.
         os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+        _bind_numa(self.local_rank)
         self.device = torch.device(f"cuda:{self.local_rank}")
         torch.cuda.set_device(self.device)
 
@@ -228,6 +229,18 @@ def _init_distributed_environment(
     torch.distributed.all_reduce(torch.zeros(1).cuda())
     initialize_model_parallel(parallel_config.tensor_parallel_size,
                               parallel_config.pipeline_parallel_size)
+
+
+def _bind_numa(local_rank: int) -> None:
+    # For MarsV2 only
+    try:
+        from hfai.utils import which_numa
+        from hfai._C.multiprocessing import numa
+        devices = list(map(int, os.getenv("CUDA_VISIBLE_DEVICES").split(",")))
+        gpu_id = devices[local_rank]
+        numa.bind_numa(which_numa(gpu_id))
+    except:
+        pass
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
