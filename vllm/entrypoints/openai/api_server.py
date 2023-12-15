@@ -457,8 +457,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
         )
         if usage is not None:
             response.usage = usage
-        # exclude unset to leave details out of each sse
-        response_json = response.json(exclude_unset=True, ensure_ascii=False)
+        response_json = response.json(ensure_ascii=False)
 
         return response_json
 
@@ -700,7 +699,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         )
         if usage is not None:
             response.usage = usage
-        response_json = response.json(exclude_unset=True, ensure_ascii=False)
+        response_json = response.json(ensure_ascii=False)
 
         return response_json
 
