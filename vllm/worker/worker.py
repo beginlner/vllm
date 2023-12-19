@@ -68,6 +68,16 @@ class Worker:
                                       self.distributed_init_method)
         self.pp_rank = get_pipeline_model_parallel_rank()
 
+        if self.model_config.hf_config.haillm_config:
+            assert (self.parallel_config.expert_parallel_size %
+                    self.parallel_config.tensor_parallel_size) == 0
+            from hai_llm.parallel import init_parallel_groups
+            init_parallel_groups(
+                self.parallel_config.expert_parallel_size //
+                self.parallel_config.tensor_parallel_size, 1,
+                self.parallel_config.tensor_parallel_size,
+                self.parallel_config.expert_parallel_size)
+
         # Initialize the model.
         set_random_seed(self.model_config.seed)
 

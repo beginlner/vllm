@@ -335,10 +335,39 @@ class LlamaDecoderLayer(nn.Module):
             )
         if config.haillm_config is not None and hasattr(
                 config.haillm_config.gpt, "moe"):
-            tp_size = get_tensor_model_parallel_world_size()
-            assert tp_size == 1
             from hai_llm.model.moe_v2.llama import FusedExperts
             self.mlp = FusedExperts(config.haillm_config.gpt)
+            if self.mlp.n_shared_experts > 0:
+                tp_size = get_tensor_model_parallel_world_size()
+                self.mlp.shared_experts[0].linear1 = MergedColumnParallelLinear(
+                    self.mlp.shared_experts[0].linear1.in_features,
+                    [self.mlp.shared_experts[0].linear1.out_features * tp_size // 2] * 2,
+                    bias=False,
+                    linear_method=linear_method,
+                )
+                self.mlp.shared_experts[0].linear2 = RowParallelLinear(
+                    self.mlp.shared_experts[0].linear2.in_features * tp_size,
+                    self.mlp.shared_experts[0].linear2.out_features,
+                    bias=False,
+                    linear_method=linear_method,
+                )
+
+            def expert_parallel_weight_loader(
+                param: nn.Parameter,
+                loaded_weight: torch.Tensor,
+            ):
+                ep_rank = self.mlp.ep_group.rank() if self.mlp.ep_group else 0
+                input_dim = 0  # The expert weights is transposed in hai-llm
+                param_data = param.data
+                shard_size = param_data.shape[input_dim]
+                start_idx = ep_rank * shard_size
+                loaded_weight = loaded_weight.narrow(input_dim, start_idx,
+                                                     shard_size)
+                assert param_data.shape == loaded_weight.shape
+                param_data.copy_(loaded_weight)
+
+            self.mlp.linear1.weight.weight_loader = expert_parallel_weight_loader
+            self.mlp.linear2.weight.weight_loader = expert_parallel_weight_loader
         else:
             self.mlp = LlamaMLP(
                 hidden_size=self.hidden_size,
