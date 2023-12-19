@@ -231,6 +231,19 @@ def _init_distributed_environment(
     initialize_model_parallel(parallel_config.tensor_parallel_size,
                               parallel_config.pipeline_parallel_size)
 
+    if parallel_config.expert_parallel_size > 1:
+        # For hai-llm MoE
+        assert (parallel_config.expert_parallel_size %
+                parallel_config.tensor_parallel_size) == 0
+        from hai_llm.parallel import init_parallel_groups
+        init_parallel_groups(
+            parallel_config.expert_parallel_size //
+            parallel_config.tensor_parallel_size,
+            parallel_config.pipeline_parallel_size,
+            parallel_config.tensor_parallel_size,
+            parallel_config.expert_parallel_size,
+        )
+
 
 def _bind_numa(local_rank: int) -> None:
     # For MarsV2 only
