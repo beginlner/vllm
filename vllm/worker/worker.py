@@ -111,7 +111,8 @@ class Worker:
         peak_memory = total_gpu_memory - free_gpu_memory
 
         cache_block_size = CacheEngine.get_cache_block_size(
-            block_size, self.model_config, self.parallel_config)
+            block_size, self.model_config, self.parallel_config,
+            self.model_config.has_value_cache())
         num_gpu_blocks = int(
             (total_gpu_memory * gpu_memory_utilization - peak_memory) //
             cache_block_size)
