@@ -1,7 +1,7 @@
 import asyncio
 import time
 from functools import partial
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
 from vllm.config import ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -176,7 +176,9 @@ class _AsyncLLMEngine(LLMEngine):
             blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
+            get_all_outputs=True,
         )
+        output = output[-1]  # The last pipeline stage returns the output.
 
         return self._process_model_outputs(output, scheduler_outputs)
 
@@ -241,11 +243,23 @@ class AsyncLLMEngine:
                  worker_use_ray: bool,
                  engine_use_ray: bool,
                  *args,
+                 max_concurrent_steps: Optional[int] = None,
                  log_requests: bool = True,
                  start_engine_loop: bool = True,
                  **kwargs) -> None:
+        logger.info(
+            "Initializing an asynchronize LLM engine with config: "
+            f"worker_use_ray={worker_use_ray}, "
+            f"engine_use_ray={engine_use_ray}, "
+            f"max_concurrent_steps={max_concurrent_steps}, "
+            f"log_requests={log_requests}, "
+            f"start_engine_loop={start_engine_loop}")
+
         self.worker_use_ray = worker_use_ray
-        self.engine_use_ray = engine_use_ray
+        assert engine_use_ray is True
+        if max_concurrent_steps is None:
+            max_concurrent_steps = args[2].pipeline_parallel_size + 1
+        self.max_concurrent_steps = max_concurrent_steps
         self.log_requests = log_requests
         self.engine = self._init_engine(*args, **kwargs)
 
@@ -270,9 +284,7 @@ class AsyncLLMEngine:
 
     def _init_engine(self, *args,
                      **kwargs) -> Union[_AsyncLLMEngine, "ray.ObjectRef"]:
-        if not self.engine_use_ray:
-            engine_class = self._engine_class
-        elif self.worker_use_ray:
+        if self.worker_use_ray:
             engine_class = ray.remote(num_cpus=0)(self._engine_class).remote
         else:
             engine_class = ray.remote(num_gpus=1)(self._engine_class).remote
@@ -287,34 +299,29 @@ class AsyncLLMEngine:
         for new_request in new_requests:
             # Add the request into the vLLM engine's waiting queue.
             # TODO: Maybe add add_request_batch to reduce Ray overhead
-            if self.engine_use_ray:
-                await self.engine.add_request.remote(**new_request)
-            else:
-                self.engine.add_request(**new_request)
+            await self.engine.add_request.remote(**new_request)
 
         if finished_requests:
-            await self._engine_abort(finished_requests)
+            await self.engine.abort_request.remote(finished_requests)
 
-        if self.engine_use_ray:
-            request_outputs = await self.engine.step.remote()
-        else:
-            request_outputs = await self.engine.step_async()
+        request_outputs = await self.engine.step_async.remote()
 
         # Put the outputs into the corresponding streams.
         for request_output in request_outputs:
             self.request_tracker.process_request_output(
                 request_output, verbose=self.log_requests)
 
-    async def _engine_abort(self, request_ids: Iterable[str]):
-        if self.engine_use_ray:
-            await self.engine.abort_request.remote(request_ids)
-        else:
-            self.engine.abort_request(request_ids)
-
     async def run_engine_loop(self):
+        futures: Set[asyncio.Future] = set()
         while True:
-            await self.engine_step()
-            await asyncio.sleep(0)
+            if len(futures) == self.max_concurrent_steps:
+                done, _ = await asyncio.wait(
+                    futures, return_when=asyncio.FIRST_COMPLETED)
+                for future in done:
+                    futures.remove(future)
+                await asyncio.sleep(0)
+            futures.add(asyncio.get_event_loop().create_task(
+                self.engine_step()))
 
     async def add_request(
         self,
@@ -422,10 +429,7 @@ class AsyncLLMEngine:
 
     async def get_model_config(self) -> ModelConfig:
         """Get the model configuration of the vLLM engine."""
-        if self.engine_use_ray:
-            return await self.engine.get_model_config.remote()
-        else:
-            return self.engine.get_model_config()
+        return await self.engine.get_model_config.remote()
 
     @classmethod
     def from_engine_args(cls,
@@ -439,11 +443,12 @@ class AsyncLLMEngine:
         distributed_init_method, placement_group = initialize_cluster(
             parallel_config, engine_args.engine_use_ray)
         # Create the async LLM engine.
-        engine = cls(engine_args.worker_use_ray,
+        engine = cls(engine_configs[2].worker_use_ray,
                      engine_args.engine_use_ray,
                      *engine_configs,
                      distributed_init_method,
                      placement_group,
+                     max_concurrent_steps=engine_args.max_concurrent_steps,
                      log_requests=not engine_args.disable_log_requests,
                      log_stats=not engine_args.disable_log_stats,
                      start_engine_loop=start_engine_loop)

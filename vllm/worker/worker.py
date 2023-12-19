@@ -53,7 +53,8 @@ class Worker:
         self.rank = self.rank if self.rank is not None else int(
             os.getenv("RANK", "-1"))
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        self.device = torch.device(f"cuda:{local_rank}")
+        gpu_id = _get_gpu_id_from_local_rank(local_rank)
+        self.device = torch.device(f"cuda:{gpu_id}")
         if self.rank < 0:
             raise ValueError("Invalid or unspecified rank.")
         torch.cuda.set_device(self.device)
@@ -337,3 +338,12 @@ def _pad_to_alignment(x: List[int], multiple_of: int) -> List[int]:
 
 def _pad_to_max(x: List[int], max_len: int) -> List[int]:
     return x + [0] * (max_len - len(x))
+
+
+def _get_gpu_id_from_local_rank(local_rank: int) -> int:
+    # There are only 4 NVLink connections between 0-1, 2-3, 4-6, 5-7.
+    devices = list(map(int, os.getenv("CUDA_VISIBLE_DEVICES").split(",")))
+    indexed_devices = list(enumerate(devices))
+    priority = [0, 1, 2, 3, 4, 6, 5, 7]
+    sorted_devices = sorted(indexed_devices, key=lambda x: priority[x[1]])
+    return sorted_devices[local_rank][0]

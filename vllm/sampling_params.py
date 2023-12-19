@@ -69,12 +69,14 @@ class SamplingParams:
         logprobs: Optional[int] = None,
     ) -> None:
         self.n = n
+        assert best_of is None
         self.best_of = best_of if best_of is not None else n
         self.presence_penalty = presence_penalty
         self.frequency_penalty = frequency_penalty
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        assert use_beam_search is False
         self.use_beam_search = use_beam_search
         self.length_penalty = length_penalty
         self.early_stopping = early_stopping

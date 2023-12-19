@@ -169,7 +169,8 @@ class EngineArgs:
 @dataclass
 class AsyncEngineArgs(EngineArgs):
     """Arguments for asynchronous vLLM engine."""
-    engine_use_ray: bool = False
+    engine_use_ray: bool = True
+    max_concurrent_steps: Optional[int] = None
     disable_log_requests: bool = False
 
     @staticmethod
@@ -177,9 +178,13 @@ class AsyncEngineArgs(EngineArgs):
             parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         parser = EngineArgs.add_cli_args(parser)
         parser.add_argument('--engine-use-ray',
-                            action='store_true',
+                            type=bool,
+                            default=AsyncEngineArgs.engine_use_ray,
                             help='use Ray to start the LLM engine in a '
                             'separate process as the server process.')
+        parser.add_argument('--max-concurrent-steps',
+                            type=int,
+                            default=AsyncEngineArgs.max_concurrent_steps)
         parser.add_argument('--disable-log-requests',
                             action='store_true',
                             help='disable logging requests')

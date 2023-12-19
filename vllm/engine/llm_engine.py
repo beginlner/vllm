@@ -78,6 +78,7 @@ class LLMEngine:
             f"dtype={model_config.dtype}, "
             f"download_dir={model_config.download_dir!r}, "
             f"load_format={model_config.load_format}, "
+            f"pipeline_parallel_size={parallel_config.pipeline_parallel_size}, "
             f"tensor_parallel_size={parallel_config.tensor_parallel_size}, "
             f"seed={model_config.seed})")
         # TODO(woosuk): Print more configs in debug mode.
@@ -105,7 +106,8 @@ class LLMEngine:
         self._init_cache()
 
         # Create the scheduler.
-        self.scheduler = Scheduler(scheduler_config, cache_config)
+        self.scheduler = Scheduler(scheduler_config, cache_config,
+                                   parallel_config.pipeline_parallel_size)
 
         # Logging.
         self.last_logging_time = 0.0
@@ -514,15 +516,19 @@ class LLMEngine:
             scheduler_outputs: SchedulerOutputs) -> List[RequestOutput]:
         # Update the scheduled sequence groups with the model outputs.
         scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
+        unfinished_scheduled_seq_groups: List[RequestOutput] = []
         for seq_group, samples in zip(scheduled_seq_groups, output):
-            self._process_sequence_group_samples(seq_group, samples)
+            if not seq_group.is_finished():
+                seq_group.is_executing = False
+                self._process_sequence_group_samples(seq_group, samples)
+                unfinished_scheduled_seq_groups.append(seq_group)
 
         # Free the finished sequence groups.
         self.scheduler.free_finished_seq_groups()
 
         # Create the outputs.
         request_outputs: List[RequestOutput] = []
-        for seq_group in (scheduled_seq_groups +
+        for seq_group in (unfinished_scheduled_seq_groups +
                           scheduler_outputs.ignored_seq_groups):
             request_output = RequestOutput.from_seq_group(seq_group)
             request_outputs.append(request_output)
@@ -554,7 +560,9 @@ class LLMEngine:
             blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
+            get_all_outputs=True,
         )
+        output = output[-1]  # The last pipeline stage returns the output.
 
         return self._process_model_outputs(output, scheduler_outputs)
 

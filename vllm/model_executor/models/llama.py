@@ -25,6 +25,7 @@
 The input of the model is flattened to a 1D tensor of tokens. The model uses
 InputMetadata to extract the original 2D shape of the input.
 """
+import re
 from typing import List, Optional, Tuple
 
 import torch
@@ -40,9 +41,12 @@ from vllm.model_executor.weight_utils import (
     load_tensor_parallel_weights, load_padded_tensor_parallel_vocab,
     hf_model_weights_iterator)
 from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
+    get_pipeline_model_parallel_rank, get_pipeline_model_parallel_world_size)
 from vllm.model_executor.parallel_utils.tensor_parallel import (
     VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear)
+from vllm.model_executor.parallel_utils.pipeline_parallel import (
+    send_to_next_pp_rank, receive_from_prev_pp_rank)
 from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
@@ -201,23 +205,31 @@ class LlamaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        vocab_size = ((config.vocab_size + 63) // 64) * 64
-        self.embed_tokens = VocabParallelEmbedding(
-            vocab_size, config.hidden_size, perform_initialization=False)
+        self.pp_size = get_pipeline_model_parallel_world_size()
+        self.pp_rank = get_pipeline_model_parallel_rank()
+        if self.pp_rank == 0:
+            vocab_size = ((config.vocab_size + 63) // 64) * 64
+            self.embed_tokens = VocabParallelEmbedding(
+                vocab_size, config.hidden_size, perform_initialization=False)
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config) for _ in range(
+                config.num_hidden_layers // self.pp_size)
         ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_rank == self.pp_size - 1:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if self.pp_rank == 0:
+            hidden_states = self.embed_tokens(input_)
+        else:
+            hidden_states = input_
         for i in range(len(self.layers)):
             if cache_events is None:
                 cache_event = None
@@ -231,23 +243,28 @@ class LlamaModel(nn.Module):
                 input_metadata,
                 cache_event,
             )
-        hidden_states = self.norm(hidden_states)
+        if self.pp_rank == self.pp_size - 1:
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
 class LlamaForCausalLM(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
         self.model = LlamaModel(config)
-        vocab_size = ((config.vocab_size + 63) // 64) * 64
-        self.lm_head = ColumnParallelLinear(config.hidden_size,
-                                            vocab_size,
-                                            bias=False,
-                                            gather_output=False,
-                                            perform_initialization=False)
-        self.sampler = Sampler(config.vocab_size)
+        self.dtype = torch.get_default_dtype()
+        self.pp_size = get_pipeline_model_parallel_world_size()
+        self.pp_rank = get_pipeline_model_parallel_rank()
+        if self.pp_rank == self.pp_size - 1:
+            vocab_size = ((config.vocab_size + 63) // 64) * 64
+            self.lm_head = ColumnParallelLinear(config.hidden_size,
+                                                vocab_size,
+                                                bias=False,
+                                                gather_output=False,
+                                                perform_initialization=False)
+            self.sampler = Sampler(config.vocab_size)
 
     def forward(
         self,
@@ -256,12 +273,21 @@ class LlamaForCausalLM(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
-    ) -> SamplerOutput:
-        hidden_states = self.model(input_ids, positions, kv_caches,
+    ) -> Optional[SamplerOutput]:
+        if self.pp_rank == 0:
+            input_ = input_ids
+        else:
+            shape = [positions.shape[0], self.config.hidden_size]
+            input_ = receive_from_prev_pp_rank(shape, self.dtype)
+        hidden_states = self.model(input_, positions, kv_caches,
                                    input_metadata, cache_events)
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   input_metadata)
-        return next_tokens
+        if self.pp_rank == self.pp_size - 1:
+            next_tokens = self.sampler(self.lm_head.weight, hidden_states,
+                                       input_metadata)
+            return next_tokens
+        else:
+            send_to_next_pp_rank(hidden_states)
+            return None
 
     _column_parallel_weights = [
         "qkv_proj.weight", "gate_proj.weight", "up_proj.weight"
@@ -274,7 +300,7 @@ class LlamaForCausalLM(nn.Module):
                      load_format: str = "auto"):
         tp_size = get_tensor_model_parallel_world_size()
         tensor_model_parallel_rank = get_tensor_model_parallel_rank()
-        q_proj_shard_size = (self.config.hidden_size // tp_size)
+        q_proj_shard_size = self.config.hidden_size // tp_size
         kv_proj_shard_size = (self.config.hidden_size //
                               self.config.num_attention_heads *
                               self.config.num_key_value_heads // tp_size)
@@ -287,8 +313,21 @@ class LlamaForCausalLM(nn.Module):
         ]
         state_dict = self.state_dict()
 
+        num_layers_per_pp_rank = self.config.num_hidden_layers // self.pp_size
+        layer_id_begin = self.pp_rank * num_layers_per_pp_rank
+        layer_id_end = (self.pp_rank + 1) * num_layers_per_pp_rank
+
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format):
+            # Map the layer id to the current pipeline stage.
+            numbers = re.findall(r"\d+", name)
+            if len(numbers) > 0:
+                number = int(numbers[0])
+                if number < layer_id_begin or number >= layer_id_end:
+                    continue
+                new_number = number - layer_id_begin
+                name = re.sub(str(number), str(new_number), name)
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -326,6 +365,9 @@ class LlamaForCausalLM(nn.Module):
                 is_gate_up_weight = True
                 break
             if is_gate_up_weight:
+                continue
+
+            if not name in state_dict:
                 continue
 
             param = state_dict[name]
