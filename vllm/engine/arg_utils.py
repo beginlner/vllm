@@ -23,6 +23,7 @@ class EngineArgs:
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
+    data_parallel_rank: int = 0
     max_parallel_loading_workers: Optional[int] = None
     swap_space: int = 4  # GiB
     gpu_memory_utilization: float = 0.90
@@ -142,6 +143,11 @@ class EngineArgs:
                             type=int,
                             default=EngineArgs.expert_parallel_size,
                             help='number of expert parallel replicas')
+        parser.add_argument('--data-parallel-rank',
+                            type=int,
+                            default=EngineArgs.data_parallel_rank,
+                            help='rank in data parallel group, used in '
+                            'expert parallel')
         parser.add_argument(
             '--max-parallel-loading-workers',
             type=int,
@@ -239,6 +245,7 @@ class EngineArgs:
         parallel_config = ParallelConfig(self.pipeline_parallel_size,
                                          self.tensor_parallel_size,
                                          self.expert_parallel_size,
+                                         self.data_parallel_rank,
                                          self.worker_use_ray,
                                          self.max_parallel_loading_workers)
         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,

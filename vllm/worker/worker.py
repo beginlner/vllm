@@ -200,6 +200,10 @@ class Worker:
                                                  self.gpu_cache)
         return output
 
+    @torch.inference_mode()
+    def execute_model_with_placeholder(self) -> None:
+        self.model_runner.execute_model_with_placeholder()
+
 
 def _init_distributed_environment(
     parallel_config: ParallelConfig,
@@ -207,41 +211,37 @@ def _init_distributed_environment(
     distributed_init_method: Optional[str] = None,
 ) -> None:
     """Initialize the distributed environment."""
-    if torch.distributed.is_initialized():
-        torch_world_size = torch.distributed.get_world_size()
-        if torch_world_size != parallel_config.world_size:
-            raise RuntimeError(
-                "torch.distributed is already initialized but the torch world "
-                "size does not match parallel_config.world_size "
-                f"({torch_world_size} vs. {parallel_config.world_size}).")
-    elif not distributed_init_method:
-        raise ValueError(
-            "distributed_init_method must be set if torch.distributed "
-            "is not already initialized")
-    else:
-        torch.distributed.init_process_group(
-            backend="nccl",
-            world_size=parallel_config.world_size,
-            rank=rank,
-            init_method=distributed_init_method,
-        )
-
-    # A small all_reduce for warmup.
-    torch.distributed.all_reduce(torch.zeros(1).cuda())
-    initialize_model_parallel(parallel_config.tensor_parallel_size,
-                              parallel_config.pipeline_parallel_size)
-
+    data_parallel_size = 1
     if parallel_config.expert_parallel_size > 1:
         # For hai-llm MoE
         assert (parallel_config.expert_parallel_size %
                 parallel_config.tensor_parallel_size) == 0
+        data_parallel_size = (parallel_config.expert_parallel_size //
+                              parallel_config.tensor_parallel_size)
+    assert parallel_config.data_parallel_rank < data_parallel_size
+
+    torch.distributed.init_process_group(
+        backend="nccl",
+        world_size=data_parallel_size * parallel_config.world_size,
+        rank=parallel_config.data_parallel_rank * parallel_config.world_size +
+        rank,
+        init_method=distributed_init_method,
+    )
+
+    # A small all_reduce for warmup.
+    torch.distributed.all_reduce(torch.zeros(1).cuda())
+    initialize_model_parallel(parallel_config.tensor_parallel_size,
+                              data_parallel_size)  # TODO: Assume no PP, Fix it
+
+    if parallel_config.expert_parallel_size > 1:
+        # For hai-llm MoE
         from hai_llm.parallel import init_parallel_groups
         init_parallel_groups(
-            parallel_config.expert_parallel_size //
-            parallel_config.tensor_parallel_size,
+            data_parallel_size,
             parallel_config.pipeline_parallel_size,
             parallel_config.tensor_parallel_size,
             parallel_config.expert_parallel_size,
+            order="pp dp tp",
         )
 
 

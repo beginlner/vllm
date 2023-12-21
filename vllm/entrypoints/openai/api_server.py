@@ -55,6 +55,9 @@ async def lifespan(app: fastapi.FastAPI):
     if not engine_args.disable_log_stats:
         asyncio.create_task(_force_log())
 
+    if engine.run_forever:
+        engine.start_background_loop()
+
     yield
 
 

@@ -81,6 +81,7 @@ class LLMEngine:
             f"load_format={model_config.load_format}, "
             f"tensor_parallel_size={parallel_config.tensor_parallel_size}, "
             f"expert_parallel_size={parallel_config.expert_parallel_size}, "
+            f"data_parallel_rank={parallel_config.data_parallel_rank}, "
             f"quantization={model_config.quantization}, "
             f"enforce_eager={model_config.enforce_eager}, "
             f"seed={model_config.seed})")
@@ -90,6 +91,8 @@ class LLMEngine:
         self.cache_config = cache_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
+        self.run_forever = (parallel_config.tensor_parallel_size <
+                            parallel_config.expert_parallel_size)
         self.log_stats = log_stats
         self._verify_args()
 
@@ -124,6 +127,15 @@ class LLMEngine:
         # List of (timestamp, num_tokens)
         self.num_generation_tokens: List[Tuple[float, int]] = []
 
+    def _get_distributed_init_method(self):
+        ip = os.getenv('MASTER_ADDR', "localhost")
+        if (self.parallel_config.expert_parallel_size >
+                self.parallel_config.tensor_parallel_size):
+            port = os.getenv('MASTER_PORT', '23333')
+        else:
+            port = get_open_port()
+        return f"tcp://{ip}:{port}"
+
     def _init_workers(self):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
         # before CUDA_VISIBLE_DEVICES is set in the Worker
@@ -133,7 +145,7 @@ class LLMEngine:
             "Ray is required if parallel_config.world_size > 1.")
 
         self.workers: List[Worker] = []
-        distributed_init_method = f"tcp://{get_ip()}:{get_open_port()}"
+        distributed_init_method = self._get_distributed_init_method()
         self.driver_worker = Worker(
             self.model_config,
             self.parallel_config,
@@ -208,7 +220,7 @@ class LLMEngine:
         for worker, (node_id, _) in zip(self.workers, worker_node_and_gpu_ids):
             worker.set_cuda_visible_devices.remote(node_gpus[node_id])
 
-        distributed_init_method = f"tcp://{driver_ip}:{get_open_port()}"
+        distributed_init_method = self._get_distributed_init_method()
 
         # Lazy import the Worker to avoid importing torch.cuda/xformers
         # before CUDA_VISIBLE_DEVICES is set in the Worker
@@ -736,6 +748,8 @@ class LLMEngine:
             # Only the driver worker returns the sampling results.
             output = all_outputs[0]
         else:
+            if self.run_forever:
+                self._run_workers("execute_model_with_placeholder")
             output = []
 
         return self._process_model_outputs(output, scheduler_outputs)

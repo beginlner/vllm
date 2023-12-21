@@ -332,6 +332,7 @@ class ParallelConfig:
         pipeline_parallel_size: Number of pipeline parallel groups.
         tensor_parallel_size: Number of tensor parallel groups.
         expert_parallel_size: Number of expert parallel groups.
+        data_parallel_rank: Rank in data parallel group.
         worker_use_ray: Whether to use Ray for model workers. Will be set to
             True if either pipeline_parallel_size or tensor_parallel_size is
             greater than 1.
@@ -342,12 +343,14 @@ class ParallelConfig:
         pipeline_parallel_size: int,
         tensor_parallel_size: int,
         expert_parallel_size: int,
+        data_parallel_rank: int,
         worker_use_ray: bool,
         max_parallel_loading_workers: Optional[int] = None,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.expert_parallel_size = expert_parallel_size
+        self.data_parallel_rank = data_parallel_rank
         self.worker_use_ray = worker_use_ray
         self.max_parallel_loading_workers = max_parallel_loading_workers
 

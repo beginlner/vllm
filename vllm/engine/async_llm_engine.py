@@ -199,6 +199,8 @@ class _AsyncLLMEngine(LLMEngine):
             # Only the driver worker returns the sampling results.
             output = all_outputs[0]
         else:
+            if self.run_forever:
+                await self._run_workers_async("execute_model_with_placeholder")
             output = []
 
         return self._process_model_outputs(output, scheduler_outputs)
@@ -263,12 +265,14 @@ class AsyncLLMEngine:
                  worker_use_ray: bool,
                  engine_use_ray: bool,
                  *args,
+                 run_forever: bool = False,
                  log_requests: bool = True,
                  max_log_len: Optional[int] = None,
                  start_engine_loop: bool = True,
                  **kwargs) -> None:
         self.worker_use_ray = worker_use_ray
         self.engine_use_ray = engine_use_ray
+        self.run_forever = run_forever
         self.log_requests = log_requests
         self.max_log_len = max_log_len
         self.engine = self._init_engine(*args, **kwargs)
@@ -357,6 +361,10 @@ class AsyncLLMEngine:
 
     async def run_engine_loop(self):
         # Initialize the RequestTracker here so it uses the right event loop.
+        if self.run_forever:
+            while True:
+                await self.engine_step()
+                await asyncio.sleep(0)
         has_requests_in_progress = False
         while True:
             if not has_requests_in_progress:
@@ -545,6 +553,8 @@ class AsyncLLMEngine:
                      engine_args.engine_use_ray,
                      *engine_configs,
                      placement_group,
+                     run_forever=(parallel_config.tensor_parallel_size <
+                                  parallel_config.expert_parallel_size),
                      log_requests=not engine_args.disable_log_requests,
                      log_stats=not engine_args.disable_log_stats,
                      max_log_len=engine_args.max_log_len,

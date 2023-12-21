@@ -302,6 +302,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        layer_id: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -327,14 +328,14 @@ class LlamaDecoderLayer(nn.Module):
                 linear_method=linear_method,
             )
         if config.haillm_config is not None and hasattr(
-                config.haillm_config.gpt, "moe"):
+                config.haillm_config.gpt, "moe") and layer_id >= getattr(
+                    config.haillm_config.gpt.moe, "first_k_dense_replace",
+                    0) and layer_id % getattr(config.haillm_config.gpt.moe,
+                                              "moe_layer_freq", 1) == 0:
             from hai_llm.model.moe_v2.llama import FusedExperts
-            self.mlp = FusedExperts(config.haillm_config.gpt)
-            tp_size = get_tensor_model_parallel_world_size()
-            ep_size = self.mlp.ep_group.size() if self.mlp.ep_group else 1
-            if tp_size != ep_size:
-                raise NotImplementedError("(TP != EP) is not supported yet.")
+            self.mlp = FusedExperts(config.haillm_config.gpt, layer_id)
             if self.mlp.n_shared_experts > 0:
+                tp_size = get_tensor_model_parallel_world_size()
                 self.mlp.shared_experts[0].linear1 = MergedColumnParallelLinear(
                     self.mlp.shared_experts[0].linear1.in_features,
                     [self.mlp.shared_experts[0].linear1.out_features * tp_size // 2] * 2,
@@ -421,8 +422,8 @@ class LlamaModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, linear_method)
-            for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, linear_method, layer_id)
+            for layer_id in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

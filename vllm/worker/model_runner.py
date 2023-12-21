@@ -467,6 +467,23 @@ class ModelRunner:
         return output
 
     @torch.inference_mode()
+    def execute_model_with_placeholder(self) -> None:
+        sampling_params = SamplingParams(temperature=0.0)
+        seqs = [
+            SequenceGroupMetadata(
+                request_id="placeholder",
+                is_prompt=True,
+                seq_data={0: SequenceData([0])},
+                sampling_params=sampling_params,
+                block_tables=None,
+            )
+        ]
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        kv_caches = [(None, None)] * num_layers
+        self.execute_model(seqs, kv_caches)
+        return
+
+    @torch.inference_mode()
     def profile_run(self) -> None:
         # Enable top-k sampling to reflect the accurate memory usage.
         vocab_size = self.model_config.get_vocab_size()
