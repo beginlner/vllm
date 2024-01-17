@@ -1,6 +1,9 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/serve/openai_api_server.py
 
+import os
+import requests
+import threading
 import argparse
 import asyncio
 import codecs
@@ -36,6 +39,8 @@ from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.utils import random_uuid
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
+VLLM_HEART_BEAT_INTERVAL = int(os.getenv("VLLM_WORKER_HEART_BEAT_INTERVAL",
+                                         15))
 
 logger = init_logger(__name__)
 served_model = None
@@ -62,6 +67,135 @@ async def lifespan(app: fastapi.FastAPI):
 
 
 app = fastapi.FastAPI(lifespan=lifespan)
+
+
+class VLLMManager:
+
+    def __init__(
+        self,
+        worker_addr: str,
+        controller_addr: str,
+        model: str,
+        register: bool,
+    ):
+        self.worker_addr = worker_addr
+        self.controller_addr = controller_addr
+        self.model = model
+        self.register = register
+        self.headers = {"Host": "coder.deepseek.com"}
+
+        self.heart_beat_thread = None
+        if register:
+            self.running = True
+            self.init_heart_beat()
+
+        self.suspend_thread = None
+        self.init_suspend_thread()
+
+    def init_heart_beat(self):
+
+        def heart_beat_worker():
+            time.sleep(5)  # Waiting server for initialization.
+            self.register_to_controller()
+            while True:
+                time.sleep(VLLM_HEART_BEAT_INTERVAL)
+                self.send_heart_beat()
+
+        self.heart_beat_thread = threading.Thread(
+            target=heart_beat_worker,
+            daemon=True,
+        )
+        self.heart_beat_thread.start()
+
+    def register_to_controller(self):
+        logger.info("Register to controller")
+
+        url = self.controller_addr + "/register_worker"
+        data = {
+            "worker_addr": self.worker_addr,
+            "model": self.model,
+        }
+        while True:
+            try:
+                ret = requests.post(url,
+                                    json=data,
+                                    timeout=5,
+                                    headers=self.headers)
+                status = ret.json()["code"]
+                break
+            except (requests.exceptions.RequestException, KeyError) as e:
+                logger.error(f"register worker error: {e}")
+            time.sleep(5)
+
+        assert status == 0
+
+    def send_heart_beat(self):
+        logger.info(f"Send heart beat. Model: {self.model} ")
+
+        url = self.controller_addr + "/receive_heart_beat"
+        data = {
+            "worker_addr": self.worker_addr,
+            "model": self.model,
+        }
+        while True:
+            try:
+                ret = requests.post(url,
+                                    json=data,
+                                    timeout=5,
+                                    headers=self.headers)
+                status = ret.json()["code"]
+                break
+            except (requests.exceptions.RequestException, KeyError) as e:
+                logger.error(f"heart beat error: {e}")
+            time.sleep(5)
+
+        if status != 0 and self.running:
+            self.register_to_controller()
+
+    def init_suspend_thread(self):
+
+        def suspend_worker():
+            import hfai
+            while True:
+                if hfai.receive_suspend_command():
+                    logger.info(f"Receive suspend command")
+                    break
+                time.sleep(1)
+            if self.register:
+                self.running = False
+                self.send_suspend()
+                logger.info(f"Suspend command sended to controller")
+
+        self.suspend_thread = threading.Thread(
+            target=suspend_worker,
+            daemon=True,
+        )
+        self.suspend_thread.start()
+
+    def send_suspend(self):
+        if not self.register:
+            return
+
+        logger.info("Send suspend to controller")
+
+        url = self.controller_addr + "/receive_suspend"
+        data = {
+            "worker_addr": self.worker_addr,
+            "model": self.model,
+        }
+        while True:
+            try:
+                ret = requests.post(url,
+                                    json=data,
+                                    timeout=5,
+                                    headers=self.headers)
+                status = ret.json()["code"]
+                break
+            except (requests.exceptions.RequestException, KeyError) as e:
+                logger.error(f"send suspend error: {e}")
+            time.sleep(5)
+
+        assert status == 0
 
 
 def parse_args():
@@ -114,6 +248,17 @@ def parse_args():
         type=str,
         default=None,
         help="FastAPI root_path when app is behind a path based routing proxy")
+
+    # Custom arguments
+    parser.add_argument("--worker-address",
+                        type=str,
+                        default="http://localhost:8000")
+    parser.add_argument("--controller-address",
+                        type=str,
+                        default="http://localhost:21001")
+    parser.add_argument("--register",
+                        action="store_true",
+                        help="Whether to regitser to the controller.")
 
     parser = AsyncEngineArgs.add_cli_args(parser)
     return parser.parse_args()
@@ -178,16 +323,15 @@ async def check_length(
 
     if request.max_tokens is None:
         request.max_tokens = max_model_len - token_num
-    if token_num + request.max_tokens > max_model_len:
+    if token_num >= max_model_len:
         return input_ids, create_error_response(
             HTTPStatus.BAD_REQUEST,
             f"This model's maximum context length is {max_model_len} tokens. "
-            f"However, you requested {request.max_tokens + token_num} tokens "
-            f"({token_num} in the messages, "
-            f"{request.max_tokens} in the completion). "
+            f"However, you requested {token_num} in the messages. "
             f"Please reduce the length of the messages or completion.",
         )
     else:
+        request.max_tokens = min(request.max_tokens, max_model_len - token_num)
         return input_ids, None
 
 
@@ -278,7 +422,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return error_check_ret
 
     model_name = request.model
-    request_id = f"cmpl-{random_uuid()}"
+    request_id = request.id or f"cmpl-{random_uuid()}"
     created_time = int(time.monotonic())
     chunk_object_type = "chat.completion.chunk"
     try:
@@ -317,13 +461,22 @@ async def create_chat_completion(request: ChatCompletionRequest,
         # Send first response for each request.n (index) with the role
         role = get_role()
         for i in range(request.n):
+            prompt_tokens = len(token_ids)
+            usage = UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                total_tokens=prompt_tokens,
+            )
             choice_data = ChatCompletionResponseStreamChoice(
                 index=i, delta=DeltaMessage(role=role), finish_reason=None)
             chunk = ChatCompletionStreamResponse(id=request_id,
                                                  object=chunk_object_type,
                                                  created=created_time,
+                                                 payload=None,
+                                                 last_request_id=None,
                                                  choices=[choice_data],
-                                                 model=model_name)
+                                                 model=model_name,
+                                                 usage=usage)
             data = chunk.json(exclude_unset=True, ensure_ascii=False)
             yield f"data: {data}\n\n"
 
@@ -345,6 +498,8 @@ async def create_chat_completion(request: ChatCompletionRequest,
                         id=request_id,
                         object=chunk_object_type,
                         created=created_time,
+                        payload=None,
+                        last_request_id=None,
                         choices=[choice_data],
                         model=model_name)
                     data = chunk.json(exclude_unset=True, ensure_ascii=False)
@@ -375,9 +530,11 @@ async def create_chat_completion(request: ChatCompletionRequest,
                         id=request_id,
                         object=chunk_object_type,
                         created=created_time,
+                        payload=res.payload,
+                        last_request_id=res.last_request_id,
                         choices=[choice_data],
                         model=model_name)
-                    data = chunk.json(exclude_unset=True, ensure_ascii=False)
+                    data = chunk.json(ensure_ascii=False)
                     yield f"data: {data}\n\n"
                 else:
                     # Send the finish response for each request.n only once
@@ -388,18 +545,19 @@ async def create_chat_completion(request: ChatCompletionRequest,
                         total_tokens=prompt_tokens + previous_num_tokens[i],
                     )
                     choice_data = ChatCompletionResponseStreamChoice(
-                        index=i, delta=[], finish_reason=output.finish_reason)
+                        index=i,
+                        delta=DeltaMessage(content=""),
+                        finish_reason=output.finish_reason)
                     chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
                         created=created_time,
+                        payload=res.payload,
+                        last_request_id=res.last_request_id,
                         choices=[choice_data],
-                        model=model_name)
-                    if final_usage is not None:
-                        chunk.usage = final_usage
-                    data = chunk.json(exclude_unset=True,
-                                      exclude_none=True,
-                                      ensure_ascii=False)
+                        model=model_name,
+                        usage=final_usage)
+                    data = chunk.json(ensure_ascii=False)
                     yield f"data: {data}\n\n"
                     finish_reason_sent[i] = True
         # Send the final done message after all response.n are finished
@@ -449,6 +607,8 @@ async def create_chat_completion(request: ChatCompletionRequest,
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,
+            payload=final_res.payload,
+            last_request_id=final_res.last_request_id,
             model=model_name,
             choices=choices,
             usage=usage,
@@ -495,7 +655,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                                      "logit_bias is not currently supported")
 
     model_name = request.model
-    request_id = f"cmpl-{random_uuid()}"
+    request_id = request.id or f"cmpl-{random_uuid()}"
 
     use_token_ids = False
     if isinstance(request.prompt, list):
@@ -571,6 +731,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         text: str,
         logprobs: Optional[LogProbs] = None,
         finish_reason: Optional[str] = None,
+        payload: Optional[Tuple[float, int]] = None,
+        last_request_id: Optional[str] = None,
         usage: Optional[UsageInfo] = None,
     ) -> str:
         choice_data = CompletionResponseStreamChoice(
@@ -582,6 +744,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         response = CompletionStreamResponse(
             id=request_id,
             created=created_time,
+            payload=payload,
+            last_request_id=last_request_id,
             model=model_name,
             choices=[choice_data],
         )
@@ -635,6 +799,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                     text=delta_text,
                     logprobs=logprobs,
                     finish_reason=finish_reason,
+                    payload=res.payload,
+                    last_request_id=res.last_request_id,
                 )
                 yield f"data: {response_json}\n\n"
                 if output.finish_reason is not None:
@@ -652,6 +818,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                         text="",
                         logprobs=logprobs,
                         finish_reason=output.finish_reason,
+                        payload=res.payload,
+                        last_request_id=res.last_request_id,
                         usage=final_usage,
                     )
                     yield f"data: {response_json}\n\n"
@@ -719,6 +887,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     response = CompletionResponse(
         id=request_id,
         created=created_time,
+        payload=final_res.payload,
+        last_request_id=final_res.last_request_id,
         model=model_name,
         choices=choices,
         usage=usage,
@@ -773,6 +943,13 @@ if __name__ == "__main__":
 
     # Register labels for metrics
     add_global_metrics_labels(model_name=engine_args.model)
+
+    vllm_manager = VLLMManager(
+        args.worker_address,
+        args.controller_address,
+        served_model,
+        args.register,
+    )
 
     app.root_path = args.root_path
     uvicorn.run(app,

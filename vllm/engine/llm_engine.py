@@ -120,6 +120,7 @@ class LLMEngine:
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config)
 
+        self.last_request_id: str = "0-0"
         # Logging.
         self.last_logging_time = 0.0
         # List of (timestamp, num_tokens)
@@ -343,6 +344,23 @@ class LLMEngine:
                      log_stats=not engine_args.disable_log_stats)
         return engine
 
+    def get_payload(self) -> Tuple[float, int]:
+        """Returns current payload and the monotonic timestamp."""
+        return (self.scheduler.get_num_unfinished_seq_groups() /
+                self.scheduler_config.max_num_seqs, time.monotonic_ns())
+
+    def _map_request_id(self, request_id: str) -> Tuple[int, int]:
+        ts, idx = request_id.split("-")
+        return (int(ts), int(idx))
+
+    def update_last_request_id(self, request_id: str):
+        try:
+            if self._map_request_id(request_id) > self._map_request_id(
+                    self.last_request_id):
+                self.last_request_id = request_id
+        except:
+            pass
+
     def add_request(
         self,
         request_id: str,
@@ -391,6 +409,7 @@ class LLMEngine:
             >>> # continue the request processing
             >>> ...
         """
+        self.update_last_request_id(request_id)
         if arrival_time is None:
             arrival_time = time.monotonic()
         if prompt_token_ids is None:
@@ -667,12 +686,15 @@ class LLMEngine:
         self.scheduler.free_finished_seq_groups()
 
         # Create the outputs.
+        payload = self.get_payload()
         request_outputs: List[RequestOutput] = []
         for seq_group in scheduled_seq_groups:
-            request_output = RequestOutput.from_seq_group(seq_group)
+            request_output = RequestOutput.from_seq_group(
+                seq_group, payload, self.last_request_id)
             request_outputs.append(request_output)
         for seq_group in scheduler_outputs.ignored_seq_groups:
-            request_output = RequestOutput.from_seq_group(seq_group)
+            request_output = RequestOutput.from_seq_group(
+                seq_group, payload, self.last_request_id)
             request_outputs.append(request_output)
 
         if self.log_stats:
@@ -871,7 +893,7 @@ class LLMEngine:
             return
 
         # Check if the sequence has reached max_tokens.
-        if seq.get_output_len() == sampling_params.max_tokens:
+        if seq.get_output_len() > sampling_params.max_tokens:
             seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
             return
 

@@ -1,7 +1,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -53,6 +53,7 @@ class UsageInfo(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    id: Optional[str] = None
     model: str
     messages: Union[str, List[Dict[str, str]]]
     temperature: Optional[float] = 0.7
@@ -80,6 +81,7 @@ class ChatCompletionRequest(BaseModel):
 
 
 class CompletionRequest(BaseModel):
+    id: Optional[str] = None
     model: str
     # a string, array of strings, array of tokens, or array of token arrays
     prompt: Union[List[int], List[List[int]], str, List[str]]
@@ -126,6 +128,8 @@ class CompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
+    payload: Optional[Tuple[float, int]] = None
+    last_request_id: Optional[str] = None
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
@@ -142,6 +146,8 @@ class CompletionStreamResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"cmpl-{random_uuid()}")
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
+    payload: Optional[Tuple[float, int]] = None
+    last_request_id: Optional[str] = None
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo]
@@ -162,6 +168,8 @@ class ChatCompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
+    payload: Optional[Tuple[float, int]] = None
+    last_request_id: Optional[str] = None
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
@@ -182,6 +190,8 @@ class ChatCompletionStreamResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: str = "chat.completion.chunk"
     created: int = Field(default_factory=lambda: int(time.time()))
+    payload: Optional[Tuple[float, int]] = None
+    last_request_id: Optional[str] = None
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(
