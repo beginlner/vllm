@@ -72,9 +72,7 @@ class RequestOutput:
         last_request_id: Optional[str],
     ) -> None:
         self.request_id = request_id
-        self.prompt = prompt
-        self.prompt_token_ids = prompt_token_ids
-        self.prompt_logprobs = prompt_logprobs
+        self.prompt_len = len(prompt_token_ids)
         self.outputs = outputs
         self.finished = finished
         self.payload = payload
@@ -108,8 +106,8 @@ class RequestOutput:
                 # logprobs are not requested.
                 logprobs = None
             finshed_reason = SequenceStatus.get_finished_reason(seq.status)
-            output = CompletionOutput(seqs.index(seq), seq.output_text,
-                                      seq.get_output_token_ids(),
+            output = CompletionOutput(seqs.index(seq), seq.new_output_text,
+                                      seq.get_output_token_ids()[-1:],
                                       seq.get_cumulative_logprob(), logprobs,
                                       finshed_reason)
             outputs.append(output)

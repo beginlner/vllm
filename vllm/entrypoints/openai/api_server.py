@@ -519,9 +519,9 @@ async def create_chat_completion(request: ChatCompletionRequest,
 
                 if output.finish_reason is None:
                     # Send token-by-token response for each request.n
-                    delta_text = output.text[len(previous_texts[i]):]
-                    previous_texts[i] = output.text
-                    previous_num_tokens[i] = len(output.token_ids)
+                    delta_text = output.text
+                    previous_texts[i] += output.text
+                    previous_num_tokens[i] += len(output.token_ids)
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=i,
                         delta=DeltaMessage(content=delta_text),
@@ -538,7 +538,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
                     yield f"data: {data}\n\n"
                 else:
                     # Send the finish response for each request.n only once
-                    prompt_tokens = len(res.prompt_token_ids)
+                    prompt_tokens = res.prompt_len
                     final_usage = UsageInfo(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=previous_num_tokens[i],
@@ -617,6 +617,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return response
 
     # Streaming response
+    assert request.stream
     if request.stream:
         return StreamingResponse(completion_stream_generator(),
                                  media_type="text/event-stream")
@@ -763,7 +764,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             res: RequestOutput
             for output in res.outputs:
                 i = output.index
-                delta_text = output.text[len(previous_texts[i]):]
+                delta_text = output.text
                 token_ids = output.token_ids[previous_num_tokens[i]:]
                 if request.logprobs is not None:
                     top_logprobs = output.logprobs[previous_num_tokens[i]:]
@@ -791,8 +792,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                     )
                 else:
                     logprobs = None
-                previous_texts[i] = output.text
-                previous_num_tokens[i] = len(output.token_ids)
+                previous_texts[i] += output.text
+                previous_num_tokens[i] += len(output.token_ids)
                 finish_reason = output.finish_reason
                 response_json = create_stream_response_json(
                     index=i,
@@ -806,8 +807,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 if output.finish_reason is not None:
                     logprobs = (LogProbs()
                                 if request.logprobs is not None else None)
-                    prompt_tokens = len(res.prompt_token_ids)
-                    completion_tokens = len(output.token_ids)
+                    prompt_tokens = res.prompt_len
+                    completion_tokens = previous_num_tokens[i]
                     final_usage = UsageInfo(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
@@ -826,6 +827,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         yield "data: [DONE]\n\n"
 
     # Streaming response
+    assert stream
     if stream:
         return StreamingResponse(completion_stream_generator(),
                                  media_type="text/event-stream")

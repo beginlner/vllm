@@ -886,6 +886,7 @@ class LLMEngine:
         seq.prefix_offset = prefix_offset
         seq.read_offset = read_offset
         seq.output_text += new_output_text
+        seq.new_output_text = new_output_text
 
     def _check_stop(self, seq: Sequence,
                     sampling_params: SamplingParams) -> None:
@@ -896,6 +897,7 @@ class LLMEngine:
                     # Truncate the output text so that the stop string is
                     # not included in the output.
                     seq.output_text = seq.output_text[:-len(stop_str)]
+                    seq.new_output_text = seq.new_output_text[:-len(stop_str)]
                 seq.status = SequenceStatus.FINISHED_STOPPED
                 return
         if seq.get_last_token_id() in sampling_params.stop_token_ids:
