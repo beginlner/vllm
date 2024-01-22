@@ -80,12 +80,15 @@ class RequestTracker:
         self._new_requests: asyncio.Queue[Tuple[AsyncStream,
                                                 dict]] = asyncio.Queue()
         self.new_requests_event = None
+        self.new_request_outputs_event = None
+        self._new_request_outputs: List[RequestOutput] = []
 
     def __contains__(self, item):
         return item in self._request_streams
 
     def init_event(self):
         self.new_requests_event = asyncio.Event()
+        self.new_request_outputs_event = asyncio.Event()
 
     def propagate_exception(self,
                             exc: Exception,
@@ -110,6 +113,24 @@ class RequestTracker:
             if verbose:
                 logger.info(f"Finished request {request_id}.")
             self.abort_request(request_id)
+
+    async def process_new_request_outputs(self, verbose: bool = False) -> None:
+        await self.new_request_outputs_event.wait()
+
+        for request_output in self._new_request_outputs:
+            self.process_request_output(request_output, verbose=verbose)
+        self._new_request_outputs = []
+
+        self.new_request_outputs_event.clear()
+
+    def add_request_outputs(self,
+                            request_outputs: List[RequestOutput]) -> None:
+        if not self._new_request_outputs:
+            self._new_request_outputs = request_outputs
+        else:
+            self._new_request_outputs.extend(request_outputs)
+
+        self.new_request_outputs_event.set()
 
     def add_request(self, request_id: str,
                     **engine_add_request_kwargs) -> AsyncStream:
@@ -283,6 +304,8 @@ class AsyncLLMEngine:
         # collected
         self._background_loop_unshielded = None
         self.start_engine_loop = start_engine_loop
+        self._process_request_output_loop = None
+        self._process_request_output_loop_unshielded = None
         self._request_tracker = RequestTracker()
 
     @property
@@ -302,6 +325,11 @@ class AsyncLLMEngine:
             partial(_raise_exception_on_finish,
                     request_tracker=self._request_tracker))
         self.background_loop = asyncio.shield(self._background_loop_unshielded)
+
+        self._process_request_output_loop_unshielded = asyncio.get_event_loop(
+        ).create_task(self.run_process_request_output_loop())
+        self._process_request_output_loop = asyncio.shield(
+            self._process_request_output_loop_unshielded)
 
     def _init_engine(self, *args,
                      **kwargs) -> Union[_AsyncLLMEngine, "ray.ObjectRef"]:
@@ -346,10 +374,8 @@ class AsyncLLMEngine:
         else:
             request_outputs = await self.engine.step_async()
 
-        # Put the outputs into the corresponding streams.
-        for request_output in request_outputs:
-            self._request_tracker.process_request_output(
-                request_output, verbose=self.log_requests)
+        if len(request_outputs) > 0:
+            self._request_tracker.add_request_outputs(request_outputs)
 
         return len(request_outputs) > 0
 
@@ -358,6 +384,11 @@ class AsyncLLMEngine:
             await self.engine.abort_request.remote(request_ids)
         else:
             self.engine.abort_request(request_ids)
+
+    async def run_process_request_output_loop(self):
+        while True:
+            await self._request_tracker.process_new_request_outputs(
+                verbose=self.log_requests)
 
     async def run_engine_loop(self):
         # Initialize the RequestTracker here so it uses the right event loop.
