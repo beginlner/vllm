@@ -108,7 +108,7 @@ class Worker:
         # profiled peak memory.
         torch.cuda.synchronize()
         free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
-        peak_memory = total_gpu_memory - free_gpu_memory
+        peak_memory = torch.cuda.max_memory_allocated()
 
         cache_block_size = CacheEngine.get_cache_block_size(
             block_size, self.model_config, self.parallel_config,
