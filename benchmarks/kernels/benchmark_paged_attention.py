@@ -3,6 +3,7 @@ import random
 import time
 
 import torch
+from flash_attn.flash_attn_interface import get_kvcache_block_size, flash_attn_with_blocked_kvcache
 
 from vllm._C import ops
 
@@ -60,10 +61,10 @@ def main(
 
     # Create the KV cache.
     x = 16 // torch.tensor([], dtype=dtype).element_size()
-    key_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size // x, block_size, x)
+    key_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size // x, block_size, x) if version != "flash" else (NUM_BLOCKS, block_size, num_kv_heads, head_size)
     key_cache = torch.empty(size=key_cache_shape, dtype=dtype, device="cuda")
     key_cache.uniform_(-scale, scale)
-    value_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size, block_size)
+    value_cache_shape = (NUM_BLOCKS, num_kv_heads, head_size, block_size) if version != "flash" else (NUM_BLOCKS, block_size, num_kv_heads, head_size)
     value_cache = torch.empty(size=value_cache_shape,
                               dtype=dtype,
                               device="cuda")
@@ -124,6 +125,18 @@ def main(
                     max_context_len,
                     alibi_slopes,
                 )
+            elif version == "flash":
+                flash_attn_with_blocked_kvcache(
+                    query.unsqueeze(1),
+                    key_cache,
+                    value_cache,
+                    block_tables,
+                    context_lens,
+                    out=output.unsqueeze(1),
+                    softmax_scale=scale,
+                    causal=True,
+                    alibi_slopes=alibi_slopes,
+                )
             else:
                 raise ValueError(f"Invalid version: {version}")
         torch.cuda.synchronize()
@@ -150,7 +163,7 @@ if __name__ == '__main__':
         description="Benchmark the paged attention kernel.")
     parser.add_argument("--version",
                         type=str,
-                        choices=["v1", "v2"],
+                        choices=["v1", "v2", "flash"],
                         default="v2")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--context-len", type=int, default=4096)
@@ -169,6 +182,8 @@ if __name__ == '__main__':
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
+    if args.version == "flash":
+        args.block_size = get_kvcache_block_size(args.head_size)
     print(args)
 
     if args.num_query_heads % args.num_kv_heads != 0:
