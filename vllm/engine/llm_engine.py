@@ -1,5 +1,6 @@
 import copy
 from collections import defaultdict
+import gc
 import os
 import time
 from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple,
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _LOGGING_INTERVAL_SEC = 5
+_GC_INTERVAL_SEC = 5
 
 
 class LLMEngine:
@@ -123,6 +125,9 @@ class LLMEngine:
         self.last_request_id: str = "0-0"
         # Logging.
         self.last_logging_time = 0.0
+        # Garbage collect.
+        self.last_gc_time = 0.0
+        gc.disable()
         # List of (timestamp, num_tokens)
         self.num_prompt_tokens: List[Tuple[float, int]] = []
         # List of (timestamp, num_tokens)
@@ -701,6 +706,7 @@ class LLMEngine:
             # Log the system stats.
             self._log_system_stats(scheduler_outputs.prompt_run,
                                    scheduler_outputs.num_batched_tokens)
+        self._garbage_collect()
         return request_outputs
 
     def step(self) -> List[RequestOutput]:
@@ -775,6 +781,15 @@ class LLMEngine:
             output = []
 
         return self._process_model_outputs(output, scheduler_outputs)
+
+    def _garbage_collect(self) -> None:
+        now = time.monotonic()
+        should_gc = now - self.last_gc_time >= _GC_INTERVAL_SEC
+        if not should_gc:
+            return
+
+        gc.collect()
+        self.last_gc_time = now
 
     def do_log_stats(self) -> None:
         self._log_system_stats(False, 0)
