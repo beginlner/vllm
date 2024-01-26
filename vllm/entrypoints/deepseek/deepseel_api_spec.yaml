@@ -1,0 +1,101 @@
+openapi: 3.0.3
+info:
+  title: Deepseek entrypoint generate api
+  description: Deepseek entrypoint generate api
+  version: 1.0.0
+servers:
+  - url: 'https://localhost:37900/'
+paths:
+  /generate:
+    post:
+      description: generata
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VLLMGenerationSchema'
+      responses:
+        200:
+          description: streaming response
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/VLLMGenerationResponseSchema'
+components:
+  schemas:
+    SamplingParamsSchema:
+      description: refer to [openai api](https://platform.openai.com/docs/api-reference/chat/create)
+      type: object
+      properties:
+        n:
+          type: integer
+        presence_penalty:
+          type: number
+        frequency_penalty:
+          type: number
+        repetition_penalty:
+          type: number
+        temperature:
+          type: number
+        top_p:
+          type: number
+        min_p:
+          type: number
+        stop_token_ids:
+          type: array
+          items:
+            type: integer
+        max_tokens:
+          type: integer
+        best_of:
+          type: integer
+        top_k:
+          type: integer
+        use_beam_search:
+          type: boolean
+          description: from vllm
+    VLLMGenerationSchema:
+      properties:
+        sampling_params:
+          $ref: '#/components/schemas/SamplingParamsSchema'
+        request_id:
+          type: string
+        token_ids:
+          type: array
+          items:
+            type: integer
+    VLLMGenerationOutputSchema:
+      properties:
+        index:
+          type: int
+        token_ids:
+          type: array
+          items:
+            type: int
+        cumulative_logprob:
+          type: float
+        logprobs:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              key:
+                type: integer
+              value:
+                type: number
+        finish_reason:
+          type: string
+    VLLMGenerationResponseSchema:
+      type: object
+      properties:
+        request_id:
+          type: string
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/VLLMGenerationOutputSchema'
+        payload:
+          type: array
+        last_request_id:
+          type: string
