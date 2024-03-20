@@ -138,6 +138,10 @@ class SamplingTensors:
             frequency_penalties += [f] * len(seq_ids)
             repetition_penalties += [r] * len(seq_ids)
 
+            if not do_penalties:
+                prompt_tokens = [[]]
+                output_tokens = [[]]
+
         sampling_tensors = SamplingTensors.from_lists(
             temperatures, top_ps, top_ks, min_ps, presence_penalties,
             frequency_penalties, repetition_penalties, prompt_tokens,
